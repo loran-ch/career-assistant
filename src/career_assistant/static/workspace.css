@@ -30,6 +30,8 @@ body{margin:0;background:#f5f7fa;color:#213248;font:16px/1.65 system-ui,sans-ser
 .assistant-job-toolbar .hint[aria-pressed="true"]{background:#166675;color:white}
 .chat-log{min-height:280px;max-height:520px;overflow:auto;background:#f5f7fa;border:1px solid #dce4ec;border-radius:8px;padding:14px}
 .chat-log .msg{margin:0 0 14px}.chat-log .role{font-size:12px;color:#536777}.chat-log .bubble{white-space:pre-wrap;overflow-wrap:anywhere}
+.chat-log .bubble.streaming::after{content:"▍";margin-left:2px;animation:caret 1s step-end infinite}
+@keyframes caret{50%{opacity:0}}
 .assistant-hints{display:flex;flex-wrap:wrap;gap:8px}
 button.hint{background:#edf3f6;color:#213248;padding:6px 10px;font-size:13px}
 #assistant-form textarea{min-height:88px}#assistant-clear{background:#5b6b78;margin-left:8px}

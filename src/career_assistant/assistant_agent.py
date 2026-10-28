@@ -221,7 +221,10 @@ def _model():
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise AIError("RADAR_AI_BASE_URL 必须为 HTTP(S) 地址。")
     from langchain_openai import ChatOpenAI
-    kwargs = dict(model=model, api_key=key, base_url=base, temperature=0, timeout=90)
+    kwargs = dict(
+        model=model, api_key=key, base_url=base, temperature=0,
+        timeout=180, streaming=True, stream_usage=False,
+    )
     if parsed.hostname == "api.deepseek.com":
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     return ChatOpenAI(**kwargs)
@@ -279,9 +282,32 @@ def _message_text(message) -> str:
     return str(content or "")
 
 
-def run_assistant(store: Store, message: str, snapshot_ids: list[int], resume_id: int | None,
-                  history: list[dict] | None = None, search_ids: list[int] | None = None) -> tuple[str, list[int]]:
-    """Run one Deep Agent turn. Unchecked favorites stay hidden; search hits stay visible."""
+_TOOL_STATUS = {
+    "list_selected_jobs": "正在查看已勾选岗位…",
+    "list_found_jobs": "正在整理搜索结果…",
+    "read_selected_job": "正在读取岗位介绍…",
+    "read_selected_resume": "正在读取简历…",
+    "save_tailored_resume": "正在保存针对性简历…",
+    "search_jobs_online": "正在搜索网上岗位，可能需要一两分钟…",
+    "task": "正在调用子任务…",
+}
+
+
+def _tool_name(chunk) -> str:
+    for item in getattr(chunk, "tool_call_chunks", None) or []:
+        name = item.get("name") if isinstance(item, dict) else getattr(item, "name", "")
+        if name:
+            return str(name)
+    for item in getattr(chunk, "tool_calls", None) or []:
+        name = item.get("name") if isinstance(item, dict) else getattr(item, "name", "")
+        if name:
+            return str(name)
+    return str(getattr(chunk, "name", "") or "")
+
+
+def stream_assistant(store: Store, message: str, snapshot_ids: list[int], resume_id: int | None,
+                     history: list[dict] | None = None, search_ids: list[int] | None = None):
+    """Yield status/token/done/error events for one Deep Agent turn."""
     allowed = {item["snapshot_id"] for item in store.list_favorites()}
     visible = [int(i) for i in snapshot_ids if int(i) in allowed]
     found = [int(i) for i in (search_ids or [])]
@@ -290,12 +316,53 @@ def run_assistant(store: Store, message: str, snapshot_ids: list[int], resume_id
     try:
         messages = list(history or [])
         messages.append({"role": "user", "content": message.strip()})
-        result = _agent().invoke({"messages": messages}, {"recursion_limit": 50})
-        reply = _message_text(result["messages"][-1]).strip() or "（模型没有返回文字）"
-        return reply, list(_CTX.get().get("search_ids") or found)
-    except AIError:
-        raise
+        yield {"type": "status", "text": "助手处理中…"}
+        collected: list[str] = []
+        last_status = ""
+        for chunk, metadata in _agent().stream(
+            {"messages": messages},
+            {"recursion_limit": 50},
+            stream_mode="messages",
+        ):
+            kind = getattr(chunk, "type", "") or ""
+            name = _tool_name(chunk)
+            if kind == "tool" or name:
+                status = _TOOL_STATUS.get(name, "正在调用工具…")
+                if status != last_status:
+                    last_status = status
+                    yield {"type": "status", "text": status}
+                continue
+            text = _message_text(chunk)
+            if not text:
+                continue
+            if (metadata or {}).get("langgraph_checkpoint_ns"):
+                continue
+            collected.append(text)
+            yield {"type": "token", "text": text}
+        reply = "".join(collected).strip() or "（模型没有返回文字）"
+        yield {
+            "type": "done",
+            "reply": reply,
+            "found": list(_CTX.get().get("search_ids") or found),
+        }
+    except AIError as exc:
+        yield {"type": "error", "error": str(exc)}
     except Exception as exc:
-        raise AIError(f"助手调用失败（{type(exc).__name__}）。请检查模型配置与网络。") from None
+        yield {"type": "error", "error": f"助手调用失败（{type(exc).__name__}）。请检查模型配置与网络。"}
     finally:
         _CTX.reset(token)
+
+
+def run_assistant(store: Store, message: str, snapshot_ids: list[int], resume_id: int | None,
+                  history: list[dict] | None = None, search_ids: list[int] | None = None) -> tuple[str, list[int]]:
+    """Run one Deep Agent turn. Unchecked favorites stay hidden; search hits stay visible."""
+    reply = ""
+    found: list[int] = list(search_ids or [])
+    for event in stream_assistant(store, message, snapshot_ids, resume_id, history, search_ids):
+        if event.get("type") == "token":
+            reply += event.get("text") or ""
+        elif event.get("type") == "done":
+            return event.get("reply") or reply or "（模型没有返回文字）", list(event.get("found") or found)
+        elif event.get("type") == "error":
+            raise AIError(event.get("error") or "助手调用失败。")
+    return reply.strip() or "（模型没有返回文字）", found

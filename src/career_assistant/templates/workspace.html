@@ -252,9 +252,27 @@ function appendMsg(role,text){
  wrap.className='msg';
  wrap.innerHTML='<div class="role"></div><div class="bubble"></div>';
  wrap.querySelector('.role').textContent=role==='user'?'你':'助手';
- wrap.querySelector('.bubble').textContent=text;
+ wrap.querySelector('.bubble').textContent=text||'';
  log.appendChild(wrap);
  log.scrollTop=log.scrollHeight;
+ return wrap;
+}
+async function readAssistantEvents(response, onEvent){
+ const reader=response.body.getReader();
+ const dec=new TextDecoder();
+ let buf='';
+ while(true){
+  const {value,done}=await reader.read();
+  if(done)break;
+  buf+=dec.decode(value,{stream:true});
+  const parts=buf.split('\n\n');
+  buf=parts.pop();
+  for(const part of parts){
+   const line=part.split('\n').filter(l=>l.startsWith('data:')).map(l=>l.slice(5)).join('');
+   if(!line.trim())continue;
+   onEvent(JSON.parse(line));
+  }
+ }
 }
 const chatForm=document.getElementById('assistant-form');
 if(chatForm){
@@ -268,13 +286,45 @@ if(chatForm){
   appendMsg('user',message);
   input.value='';
   send.disabled=true;
-  status.textContent='助手处理中；搜索网上岗位时可能需要一两分钟…';
+  const row=appendMsg('assistant','');
+  const bubble=row.querySelector('.bubble');
+  bubble.classList.add('streaming');
+  status.textContent='助手处理中…';
   try{
-   const r=await fetch('/assistant/chat',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({csrf,message})});
-   const data=await r.json();
-   if(data.ok){appendMsg('assistant',data.reply);status.textContent='';}
-   else{status.textContent=data.error||'发送失败';}
+   const r=await fetch('/assistant/chat',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf,'Accept':'text/event-stream'},body:JSON.stringify({csrf,message})});
+   const type=r.headers.get('content-type')||'';
+   if(!type.includes('event-stream')){
+    const data=await r.json().catch(()=>({}));
+    bubble.textContent=data.error||'发送失败';
+    status.textContent=data.error||'发送失败';
+    send.disabled=false;
+    bubble.classList.remove('streaming');
+    return;
+   }
+   let reply='';
+   let found=[];
+   await readAssistantEvents(r,event=>{
+    if(event.type==='status')status.textContent=event.text||'助手处理中…';
+    else if(event.type==='token'){
+     reply+=event.text||'';
+     bubble.textContent=reply;
+     const log=document.getElementById('chat-log');
+     if(log)log.scrollTop=log.scrollHeight;
+    }else if(event.type==='done'){
+     reply=event.reply||reply;
+     found=event.found||[];
+     bubble.textContent=reply;
+     status.textContent='';
+    }else if(event.type==='error'){
+     status.textContent=event.error||'发送失败';
+     if(!reply)bubble.textContent=event.error||'发送失败';
+    }
+   });
+   if(reply){
+    await fetch('/assistant/save',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({csrf,reply,found})});
+   }
   }catch(err){status.textContent='网络错误，请重试';}
+  bubble.classList.remove('streaming');
   send.disabled=false;
  });
 }

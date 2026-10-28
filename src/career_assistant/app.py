@@ -5,6 +5,7 @@ from career_assistant.config import resume_path
 
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import re
@@ -13,7 +14,7 @@ import sqlite3
 from urllib.parse import urlsplit
 import uuid
 
-from flask import Flask, abort, flash, redirect, render_template, request, send_file, session, url_for, jsonify
+from flask import Flask, Response, abort, flash, redirect, render_template, request, send_file, session, stream_with_context, url_for, jsonify
 from career_assistant.config import DATA_DIR, DB_PATH
 from career_assistant.db import Database
 from career_assistant.models import JobPosting, now_hk, parse_iso
@@ -604,8 +605,7 @@ def create_app(store=None, data_dir=None, testing=False):
 
     @app.post("/assistant/chat")
     def assistant_chat():
-        from career_assistant.ai import AIError
-        from career_assistant.assistant_agent import run_assistant
+        from career_assistant.assistant_agent import stream_assistant
         data = request.get_json(silent=True) or {}
         message = str(data.get("message") or "").strip()
         if not message:
@@ -617,19 +617,41 @@ def create_app(store=None, data_dir=None, testing=False):
             for item in (session.get("assistant_chat") or [])[-12:]
             if item.get("role") in {"user", "assistant"} and item.get("content")
         ]
-        try:
-            reply, found = run_assistant(
-                store, message, selected, resume_id, history,
-                search_ids=session.get("assistant_search_jobs") or [],
-            )
-        except AIError as exc:
-            return jsonify({"ok": False, "error": str(exc)}), 400
-        if found:
-            session["assistant_search_jobs"] = found
+        search_ids = list(session.get("assistant_search_jobs") or [])
         chat = list(session.get("assistant_chat") or [])
-        chat.extend([{"role": "user", "content": message}, {"role": "assistant", "content": reply}])
+        chat.append({"role": "user", "content": message})
         session["assistant_chat"] = chat[-20:]
-        return jsonify({"ok": True, "reply": reply})
+
+        def generate():
+            for event in stream_assistant(store, message, selected, resume_id, history, search_ids):
+                yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/assistant/save")
+    def assistant_save():
+        data = request.get_json(silent=True) or {}
+        reply = str(data.get("reply") or "").strip()
+        found = data.get("found") or []
+        if found:
+            cleaned = []
+            for value in found:
+                try:
+                    cleaned.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            session["assistant_search_jobs"] = cleaned
+        if reply:
+            chat = list(session.get("assistant_chat") or [])
+            last = chat[-1] if chat else None
+            if not last or last.get("role") != "assistant" or last.get("content") != reply:
+                chat.append({"role": "assistant", "content": reply})
+            session["assistant_chat"] = chat[-20:]
+        return jsonify({"ok": True})
 
     @app.post("/assistant/clear")
     def assistant_clear():
