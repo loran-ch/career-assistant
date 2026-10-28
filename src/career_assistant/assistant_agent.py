@@ -294,6 +294,9 @@ _TOOL_STATUS = {
 
 
 def _tool_name(chunk) -> str:
+    kind = getattr(chunk, "type", "") or ""
+    if kind == "tool":
+        return str(getattr(chunk, "name", "") or "")
     for item in getattr(chunk, "tool_call_chunks", None) or []:
         name = item.get("name") if isinstance(item, dict) else getattr(item, "name", "")
         if name:
@@ -302,7 +305,52 @@ def _tool_name(chunk) -> str:
         name = item.get("name") if isinstance(item, dict) else getattr(item, "name", "")
         if name:
             return str(name)
-    return str(getattr(chunk, "name", "") or "")
+    return ""
+
+
+def _wants_tailored_resumes(message: str) -> bool:
+    text = re.sub(r"\s+", "", message or "")
+    return any(key in text for key in ("针对性简历", "对应简历", "生成简历", "改写简历", "为每个勾选"))
+
+
+_RESUME_SYS = """你根据对照简历，为单一岗位写针对性简历正文（Markdown）。
+只用简历里出现的经历、技能、学历和成果。不得编造公司、数字、职级或项目。
+岗位介绍缺失时，按职位名称调整措辞，不要假装见过官方 JD。
+直接输出完整简历正文，不要前言后语。中文为主，专有名词可保留英文。"""
+
+
+def _generate_tailored_resumes():
+    ids = sorted(_selected_ids())
+    if not ids:
+        yield {"type": "token", "text": "请先在左侧勾选收藏岗位，再让我生成针对性简历。未勾选的岗位不会保存。"}
+        return
+    resume = read_selected_resume()
+    if resume.startswith("用户未选择") or resume.startswith("简历不存在"):
+        yield {"type": "token", "text": resume + "\n生成针对性简历需要先在本页选择或到「我的资料」上传简历。"}
+        return
+    from langchain_core.messages import HumanMessage, SystemMessage
+    model = _model()
+    for snapshot_id in ids:
+        item = _store().get("job_snapshots", snapshot_id) or {}
+        title = item.get("title") or f"岗位 {snapshot_id}"
+        yield {"type": "status", "text": f"正在为「{title}」生成针对性简历…"}
+        yield {"type": "token", "text": f"\n\n## {title}\n\n"}
+        job = read_selected_job(snapshot_id)
+        parts: list[str] = []
+        try:
+            for chunk in model.stream([
+                SystemMessage(content=_RESUME_SYS),
+                HumanMessage(content=f"对照简历：\n{resume}\n\n目标岗位：\n{job}\n"),
+            ]):
+                text = _message_text(chunk)
+                if text:
+                    parts.append(text)
+                    yield {"type": "token", "text": text}
+        except Exception as exc:
+            yield {"type": "token", "text": f"\n生成失败（{type(exc).__name__}）。\n"}
+            continue
+        result = save_tailored_resume(snapshot_id, f"{title} · 针对性简历", "".join(parts))
+        yield {"type": "token", "text": f"\n\n{result}\n"}
 
 
 def stream_assistant(store: Store, message: str, snapshot_ids: list[int], resume_id: int | None,
@@ -319,11 +367,34 @@ def stream_assistant(store: Store, message: str, snapshot_ids: list[int], resume
         yield {"type": "status", "text": "助手处理中…"}
         collected: list[str] = []
         last_status = ""
-        for chunk, metadata in _agent().stream(
+        if _wants_tailored_resumes(message.strip()):
+            for event in _generate_tailored_resumes():
+                if event.get("type") == "token" and event.get("text"):
+                    collected.append(event["text"])
+                yield event
+            reply = "".join(collected).strip() or "（没有生成结果）"
+            yield {"type": "done", "reply": reply, "found": list(_CTX.get().get("search_ids") or found)}
+            return
+        last_ai = ""
+        for item in _agent().stream(
             {"messages": messages},
             {"recursion_limit": 50},
-            stream_mode="messages",
+            stream_mode=["messages", "values"],
         ):
+            mode, payload = item if isinstance(item, tuple) and len(item) == 2 else ("messages", item)
+            if mode == "values":
+                msgs = (payload or {}).get("messages") or []
+                for row in reversed(msgs):
+                    if getattr(row, "type", "") == "ai" and not getattr(row, "tool_calls", None):
+                        text = _message_text(row).strip()
+                        if text:
+                            last_ai = text
+                            break
+                continue
+            if isinstance(payload, tuple) and len(payload) == 2:
+                chunk, _metadata = payload
+            else:
+                chunk = payload
             kind = getattr(chunk, "type", "") or ""
             name = _tool_name(chunk)
             if kind == "tool" or name:
@@ -331,15 +402,18 @@ def stream_assistant(store: Store, message: str, snapshot_ids: list[int], resume
                 if status != last_status:
                     last_status = status
                     yield {"type": "status", "text": status}
+                if kind == "tool":
+                    text = _message_text(chunk).strip()
+                    if text.startswith("已保存针对性简历"):
+                        collected.append("\n" + text + "\n")
+                        yield {"type": "token", "text": "\n" + text + "\n"}
                 continue
             text = _message_text(chunk)
             if not text:
                 continue
-            if (metadata or {}).get("langgraph_checkpoint_ns"):
-                continue
             collected.append(text)
             yield {"type": "token", "text": text}
-        reply = "".join(collected).strip() or "（模型没有返回文字）"
+        reply = "".join(collected).strip() or last_ai or "（模型没有返回文字）"
         yield {
             "type": "done",
             "reply": reply,
