@@ -238,9 +238,8 @@ def create_app(store=None, data_dir=None, testing=False):
     def profile():
         favorites = store.list_favorites()
         tailored = store.tailored_resume_counts()
-        matched = store.matched_job_uids()
         pending = [item for item in favorites if not tailored.get(item["job_uid"])]
-        reports = [item for item in favorites if item["job_uid"] in matched]
+        reports = [item for item in favorites if tailored.get(item["job_uid"])]
         fav = request.args.get("fav") or "pending"
         if fav not in {"pending", "reports"}:
             fav = "pending"

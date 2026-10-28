@@ -12,13 +12,13 @@
 <section id="favorites"><h2>我的收藏</h2>
 {% if favorites %}
 {% macro fav_href(view, page=1) %}{{ url_for('profile', fav=view, p=page, _anchor='favorites') }}{% endmacro %}
-<div class="assistant-filter" role="tablist" aria-label="按报告或简历筛选收藏">
+<div class="assistant-filter" role="tablist" aria-label="按是否已生成针对性简历筛选收藏">
 <a href="{{ fav_href('pending') }}" {% if fav_filter=='pending' %}aria-current="page"{% endif %} aria-pressed="{{ 'true' if fav_filter=='pending' else 'false' }}">未生成简历 <span class="badge">{{ pending_favorites|length }}</span></a>
-<a href="{{ fav_href('reports') }}" {% if fav_filter=='reports' %}aria-current="page"{% endif %} aria-pressed="{{ 'true' if fav_filter=='reports' else 'false' }}">已生成报告 <span class="badge">{{ report_favorites|length }}</span></a>
+<a href="{{ fav_href('reports') }}" {% if fav_filter=='reports' %}aria-current="page"{% endif %} aria-pressed="{{ 'true' if fav_filter=='reports' else 'false' }}">已生成简历 <span class="badge">{{ report_favorites|length }}</span></a>
 </div>
-<p class="muted">{% if fav_filter=='pending' %}显示还没有针对性简历的收藏岗位。{% else %}显示已做过匹配分析报告的收藏岗位。{% endif %}</p>
+<p class="muted">{% if fav_filter=='pending' %}显示还没有针对性简历的收藏岗位。{% else %}显示已经生成过针对性简历的收藏岗位。{% endif %}</p>
 {% for f in listed_favorites %}<article><h3><a href="/jobs/{{f.snapshot_id}}">{{f.title}}</a></h3><p>{{f.company or '公司未提供'}} · {{'用户提供' if f.source=='manual' else f.source}} · 收藏于 {{f.created_at[:10]}}</p><form action="/jobs/{{f.snapshot_id}}/favorite" method="post">{{token(request.full_path.rstrip('?') ~ '#favorites')}}<button>取消收藏</button></form></article>
-{% else %}<p>{% if fav_filter=='pending' %}收藏岗位都已有针对性简历，或还没有收藏。{% else %}还没有生成过匹配分析报告。可到岗位详情点「分析岗位」。{% endif %}</p>{% endfor %}
+{% else %}<p>{% if fav_filter=='pending' %}收藏岗位都已有针对性简历。{% else %}还没有生成过针对性简历。可到「AI助手」勾选岗位后生成。{% endif %}</p>{% endfor %}
 {% if fav_total %}<nav class="pager" aria-label="收藏分页">{% if fav_page>1 %}<a class="button" href="{{ fav_href(fav_filter, fav_page-1) }}">上一页</a>{% endif %}<span>第 {{fav_page}} / {{fav_pages}} 页 · 共 {{fav_total}} 条</span>{% if fav_page<fav_pages %}<a class="button" href="{{ fav_href(fav_filter, fav_page+1) }}">下一页</a>{% endif %}</nav>{% endif %}
 {% else %}<p>暂无收藏。到<a href="/jobs">岗位页</a>点击“收藏”即可保存到这里。</p>
 {% endif %}
