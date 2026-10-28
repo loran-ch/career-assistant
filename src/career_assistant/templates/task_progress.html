@@ -1,4 +1,5 @@
 {% from 'page.html' import token with context %}
+<span hidden data-task-status="{{task.status}}"></span>
 {% set result=task.result or {} %}
 {% set names={'analyze':'通用报告','search':'搜索岗位','materials':'准备材料','email':'邮件','prepare':'分析岗位','match':'分析岗位'} %}
 <p><strong>{{names.get(task.kind,'处理')}}</strong> · {{'等待补充' if result.status=='waiting_input' else {'queued':'等待处理','running':'处理中','succeeded':'完成','failed':'失败','uncertain':'结果不确定'}.get(task.status,task.status)}}</p>
@@ -11,4 +12,4 @@
 {% if result.material_id %}<p><a href="/materials/{{result.material_id}}">查看、编辑或导出材料／问题草稿</a></p>{% endif %}
 {% if task.kind!='fill' and (task.status in ['failed','uncertain'] or result.outcome=='partial' or result.status=='preview') %}<form action="/tasks/{{task.id}}/retry" method="post">{{token()}}{% if task.status=='uncertain' %}<p>请先核对外部结果；重试可能重复发送。</p><input type="hidden" name="confirmed" value="yes">{% endif %}<button>重试失败步骤</button></form>{% endif %}
 
-{% if task.kind=='search' and result.snapshot_ids %}<p>已获取岗位：</p>{% for sid in result.snapshot_ids %}<a href="/jobs/{{sid}}">查看候选岗位 {{loop.index}}</a> {% endfor %}{% endif %}
+{% if task.kind=='search' and result.snapshot_ids %}<p>已保存 {{result.snapshot_ids|length}} 个岗位，见下方列表。</p>{% endif %}

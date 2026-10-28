@@ -1,13 +1,28 @@
 <!doctype html><html lang="zh-Hans"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>INT6181 · 求职助手</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}"></head><body>
-<header><strong>INT6181 · 智能求职助手</strong><nav><a href="/jobs">岗位</a><a href="/applications">申请</a><a href="/profile">我的资料</a><a href="/settings">设置</a></nav></header><main>{% for message in get_flashed_messages() %}<p class="notice">{{message}}</p>{% endfor %}{% if session.get("form_error") %}<p class="notice" role="alert">{{session.pop("form_error")}}</p>{% endif %}
-{% macro token() %}<input type="hidden" name="return_to" value="{{request.path}}"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="operation" value="{{operation}}">{% endmacro %}
+<link rel="stylesheet" href="{{ url_for('static', filename='workspace.css') }}"></head><body>
+<header><strong>INT6181 · 智能求职助手</strong><nav><a href="/jobs">岗位</a><a href="/assistant">AI助手</a><a href="/applications">申请</a><a href="/profile">我的资料</a><a href="/settings">设置</a></nav></header><main>{% for message in get_flashed_messages() %}<p class="notice">{{message}}</p>{% endfor %}{% if session.get("form_error") %}<p class="notice" role="alert">{{session.pop("form_error")}}</p>{% endif %}
+{% macro token(return_to=None) %}<input type="hidden" name="return_to" value="{{return_to if return_to is not none else request.path}}"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="operation" value="{{operation}}">{% endmacro %}
 {% macro preference_select(items) %}<label>求职偏好<select name="preference_id">{% if not items %}<option value="">未设置</option>{% endif %}{% for p in items %}<option value="{{p.id}}">#{{p.id}} · {{p.data.keywords|join(' / ')}} · {{p.data.location}}</option>{% endfor %}</select></label>{% endmacro %}
+{% macro location_select(current='Hong Kong') %}{% set places=[('Hong Kong','香港'),('China','中国内地'),('United States','美国'),('United Kingdom','英国'),('Singapore','新加坡'),('Canada','加拿大'),('Australia','澳大利亚'),('Japan','日本'),('Taiwan','台湾'),('Macau','澳门'),('Remote','远程')] %}<label>地区<select name="location" required>{% for value,label in places %}<option value="{{value}}"{% if value==current %} selected{% endif %}>{{label}}</option>{% endfor %}{% if current and current not in places|map(attribute='0')|list %}<option value="{{current}}" selected>{{current}}（当前保存）</option>{% endif %}</select></label>{% endmacro %}
 {% macro resume_select(items, selected=none) %}<label>使用简历<select name="resume_id">{% for r in items %}<option value="{{r.id}}" {% if r.id==selected %}selected{% endif %}>{{r.filename}} · #{{r.id}}</option>{% endfor %}</select></label>{% endmacro %}
 {% macro review_history(items) %}{% for review in items %}<details open><summary>第 {{loop.index}} 轮 · {{'通过' if review.approved else '未通过'}}</summary><ul>{% for issue in review.issues %}<li>{{issue}}</li>{% endfor %}</ul></details>{% endfor %}{% endmacro %}
 {% set states={'queued':'等待处理','fetching_jd':'获取完整 JD','matching':'分析匹配','materials':'生成材料','matched':'分析完成','ready':'材料已准备','waiting_facts':'等待可用事实','waiting_jd':'等待补充完整 JD','failed':'失败','problem_draft':'问题草稿','reviewed':'AI 审阅通过','user_edited':'用户编辑','user_provided':'用户提供','automatic':'自动提取','running':'处理中','succeeded':'已完成','uncertain':'结果不确定','planned':'准备使用','actual':'实际使用'} %}
 {% if page=='home' %}
 <h1>我的资料</h1>{% if request.args.get("task") %}<div data-poll="/tasks/{{request.args.get('task')}}/status"></div>{% endif %}<p><a href="/preferences">设置或修改偏好</a> · <a href="/jobs">直接浏览岗位、收藏或补记投递</a></p>
+<section id="favorites"><h2>我的收藏</h2>
+{% if favorites %}
+{% macro fav_href(view, page=1) %}{{ url_for('profile', fav=view, p=page, _anchor='favorites') }}{% endmacro %}
+<div class="assistant-filter" role="tablist" aria-label="按报告或简历筛选收藏">
+<a href="{{ fav_href('pending') }}" {% if fav_filter=='pending' %}aria-current="page"{% endif %} aria-pressed="{{ 'true' if fav_filter=='pending' else 'false' }}">未生成简历 <span class="badge">{{ pending_favorites|length }}</span></a>
+<a href="{{ fav_href('reports') }}" {% if fav_filter=='reports' %}aria-current="page"{% endif %} aria-pressed="{{ 'true' if fav_filter=='reports' else 'false' }}">已生成报告 <span class="badge">{{ report_favorites|length }}</span></a>
+</div>
+<p class="muted">{% if fav_filter=='pending' %}显示还没有针对性简历的收藏岗位。{% else %}显示已做过匹配分析报告的收藏岗位。{% endif %}</p>
+{% for f in listed_favorites %}<article><h3><a href="/jobs/{{f.snapshot_id}}">{{f.title}}</a></h3><p>{{f.company or '公司未提供'}} · {{'用户提供' if f.source=='manual' else f.source}} · 收藏于 {{f.created_at[:10]}}</p><form action="/jobs/{{f.snapshot_id}}/favorite" method="post">{{token(request.full_path.rstrip('?') ~ '#favorites')}}<button>取消收藏</button></form></article>
+{% else %}<p>{% if fav_filter=='pending' %}收藏岗位都已有针对性简历，或还没有收藏。{% else %}还没有生成过匹配分析报告。可到岗位详情点「分析岗位」。{% endif %}</p>{% endfor %}
+{% if fav_total %}<nav class="pager" aria-label="收藏分页">{% if fav_page>1 %}<a class="button" href="{{ fav_href(fav_filter, fav_page-1) }}">上一页</a>{% endif %}<span>第 {{fav_page}} / {{fav_pages}} 页 · 共 {{fav_total}} 条</span>{% if fav_page<fav_pages %}<a class="button" href="{{ fav_href(fav_filter, fav_page+1) }}">下一页</a>{% endif %}</nav>{% endif %}
+{% else %}<p>暂无收藏。到<a href="/jobs">岗位页</a>点击“收藏”即可保存到这里。</p>
+{% endif %}
+</section>
 <section><h2>上传简历</h2><p>最大 10 MB 文本 PDF。自动提取事实并分析；报告失败不阻止岗位与申请管理。</p><form action="/resumes" method="post" enctype="multipart/form-data">{{token()}}<label>PDF 文件<input type="file" name="resume" accept="application/pdf" required></label><button>上传并创建分析任务</button></form></section>
 <h2>简历</h2>{% for r in resumes %}<article><a href="/resumes/{{r.id}}">{{r.filename}} · #{{r.id}}</a><form action="/resumes/{{r.id}}/select" method="post">{{token()}}<button>使用这份简历</button></form></article>{% endfor %}
 <details><summary>历史处理记录</summary>{% for t in tasks %}<p><a href="/tasks/{{t.id}}">{{t.created_at}} · {{t.kind}}</a> · {{states.get(t.status,t.status)}}</p>{% endfor %}</details>
@@ -20,9 +35,9 @@
 {% for r in reports %}<section><h2>通用报告 #{{r.id}}</h2><p>分析日期（香港）：{{r.data.analysis_date}}</p><p>{{r.data.summary}}</p><ul>{% for suggestion in r.data.suggestions %}<li>{{suggestion}}</li>{% endfor %}</ul>{% if r.data.review_history|default([])|length > 1 %}<details><summary>审阅与修正记录</summary>{{review_history(r.data.review_history)}}</details>{% endif %}<form action="/email/report/{{r.id}}" method="post">{{token()}}<button>推送报告／未发送预览</button></form></section>{% else %}<p>通用报告尚未生成。已有事实仍可使用，错误见首页任务。</p>{% endfor %}
 {% elif page=='preferences' %}
 <h1>求职偏好</h1><p>点击开始搜索即保存。偏好独立于简历，修改另存版本，不改变历史匹配。</p>{% set data=preference.data if preference else {} %}
-<form method="post"><section>{{token()}}<label>目标职位（每行一个，最多 7 个）<textarea name="keywords" required>{{data.get('keywords',[])|join('\n')}}</textarea></label><label>地区<input name="location" value="{{data.get('location','Hong Kong')}}" required></label>
+<form method="post"><section>{{token()}}<label>目标职位（每行一个，最多 7 个）<textarea name="keywords" required>{{data.get('keywords',[])|join('\n')}}</textarea></label>{{ location_select(data.get('location','Hong Kong')) }}
 <p>岗位类型</p>{% for value,label in [('internship','实习'),('part time','兼职'),('full time','全职')] %}<label><input type="checkbox" name="job_types" value="{{value}}" {% if value in data.get('job_types',[]) %}checked{% endif %}> {{label}}</label>{% endfor %}
-<p>来源：v3 真实列表均未验证；仅 LinkedIn 实现详情读取，真实详情未验证。不选来源可仅手动录入。</p>{% for source in ['linkedin','jobsdb','indeed'] %}<label><input type="checkbox" name="sources" value="{{source}}" {% if source in data.get('sources',[]) %}checked{% endif %}> {{source}}</label>{% endfor %}<button>开始搜索</button></section></form>
+<p>来源：v3 真实列表均未验证；仅 LinkedIn 实现详情读取，真实详情未验证。不选来源可仅手动录入。</p>{% for source,label in [('local','本地岗位数据'),('linkedin','linkedin'),('jobsdb','jobsdb'),('indeed','indeed')] %}<label><input type="checkbox" name="sources" value="{{source}}" {% if source in data.get('sources',['local']) %}checked{% endif %}> {{label}}</label>{% endfor %}<button>开始搜索</button></section></form>
 {% elif page=='jobs' %}
 <h1>岗位获取与申请</h1><p><a href="/preferences">设置／修改偏好</a></p>{% if preferences %}<form action="/search" method="post">{{token()}}{{preference_select(preferences)}}<button>搜索岗位</button></form>{% endif %}
 <section><h2>手动导入岗位／补记外部投递</h2><form method="post">{{token()}}<label>职位<input name="title" required></label><label>公司<input name="company" required></label><label>原岗位链接<input name="url" type="url" required></label><label>完整 JD（可留空，稍后补充）<textarea name="jd"></textarea></label><input type="hidden" name="is_full" value="yes"><button>导入岗位</button></form></section>

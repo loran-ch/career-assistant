@@ -15,6 +15,10 @@
 !/docs/UPSTREAM.md
 /src/*
 !/src/career_assistant/
+!/data/
+/data/*
+!/data/radar.db
+!/data/sample_data_analyst_jobs.json
 
 # Never publish runtime data or generated/private files inside the package.
 __pycache__/
@@ -26,6 +30,7 @@ Thumbs.db
 .env.*
 !/.env.example
 *.db
+!/data/radar.db
 *.db-*
 *.sqlite*
 *.bak

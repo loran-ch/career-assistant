@@ -81,7 +81,7 @@ def search_jobs(preferences: dict, config_path=None, *, db_path=None) -> list[Jo
     if "sources" in preferences:
         sources = preferences["sources"]
         if not isinstance(sources, list) or not sources or any(s not in SCRAPER_REGISTRY for s in sources):
-            raise ValueError("请选择有效岗位来源：jobsdb、linkedin、indeed。")
+            raise ValueError("请选择有效岗位来源：local、jobsdb、linkedin、indeed。")
         config.sources = {s: s in sources for s in SCRAPER_REGISTRY}
     _validate(config)
     if not config.enabled_sources():
@@ -95,7 +95,7 @@ def search_jobs(preferences: dict, config_path=None, *, db_path=None) -> list[Jo
     try:
         for source in config.enabled_sources():
             limit = config.daily_limits.get(source, 0)
-            if limit and db.today_counts(source) >= limit:
+            if source != "local" and limit and db.today_counts(source) >= limit:
                 raise IntegrationError(f"{source} 已达到今日抓取配额，请稍后再试。")
             scraper = get_scraper(source, config, browser, db=db, keywords=config.keywords)
             try:
@@ -118,7 +118,7 @@ def search_jobs(preferences: dict, config_path=None, *, db_path=None) -> list[Jo
                 raise IntegrationError(
                     f"{source} 网络或浏览器操作失败（{type(exc).__name__}）；请检查连接和页面加载，已有数据保留。"
                 ) from exc
-        candidates = [j for j in jobs if j.posted_at is None or j.posted_at >= cutoff]
+        candidates = [j for j in jobs if j.source == "local" or j.posted_at is None or j.posted_at >= cutoff]
         keyword_filter = KeywordFilter(config)
         jobs = keyword_filter.filter(candidates)
         # No summary means insufficient evidence for a negative keyword match.
@@ -245,6 +245,7 @@ SOURCE_CAPABILITIES = {
     "linkedin": {"listing": True, "details": True, "verification": "列表及详情曾成功，最近详情失败；新正文提取仅本地验证，真实未复验"},
     "jobsdb": {"listing": True, "details": True, "verification": "列表曾真实成功；详情适配已启用，仅本地样例验证，真实未复验"},
     "indeed": {"listing": True, "details": True, "verification": "列表历史失败原因未定；列表及详情改进仅本地样例验证，真实未复验"},
+    "local": {"listing": True, "details": False, "verification": "读取本机样例岗位，不访问招聘网站"},
     "manual": {"listing": False, "details": False, "verification": "用户提供"},
 }
 

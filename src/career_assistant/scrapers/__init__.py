@@ -19,11 +19,13 @@ from career_assistant.scrapers.browser import BrowserManager
 from career_assistant.scrapers.indeed import IndeedScraper
 from career_assistant.scrapers.jobsdb import JobsDBScraper
 from career_assistant.scrapers.linkedin import LinkedInScraper
+from career_assistant.scrapers.local import LocalScraper
 
 # 注册表：source 名 → 适配器类。
 # T04 已注册全部三站：在 config.yaml 的 sources 段把某项设为 true 即可启用。
 # （未注册却在 config 里开启，get_scraper 会给出明确中文报错而不是静默跳过）
 SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
+    "local": LocalScraper,
     "jobsdb": JobsDBScraper,
     "linkedin": LinkedInScraper,
     "indeed": IndeedScraper,

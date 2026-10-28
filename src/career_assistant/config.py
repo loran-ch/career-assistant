@@ -27,9 +27,24 @@ from career_assistant.models import HK_TZ
 # 而 config.py 的物理位置是固定的，据此推导最稳。
 # ---------------------------------------------------------------------------
 _CHECKOUT = Path(__file__).resolve().parents[2]
+
+
+def _load_dotenv(path: Path) -> None:
+    """Load project .env into os.environ; existing process env wins."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    if path.is_file():
+        load_dotenv(path, override=False)
+
+
+_load_dotenv(_CHECKOUT / ".env")
+_load_dotenv(Path.cwd() / ".env")
 PROJECT_ROOT = Path(os.environ.get("CAREER_HOME", str(
     _CHECKOUT if (_CHECKOUT / "pyproject.toml").is_file() else Path.cwd()
 ))).expanduser().resolve()
+_load_dotenv(PROJECT_ROOT / ".env")
 CONFIG_PATH = Path(os.environ.get("RADAR_CONFIG_PATH", str(PROJECT_ROOT / "config.yaml")))
 DATA_DIR = Path(os.environ.get("RADAR_DATA_DIR", str(PROJECT_ROOT / "data")))
 LOG_DIR = DATA_DIR / "logs"
@@ -159,7 +174,7 @@ def _looks_like_graduate_programme(keyword: str) -> bool:
 class LLMConfig:
     provider: str = "deepseek"
     base_url: str = "https://api.deepseek.com"
-    model: str = "deepseek-chat"
+    model: str = "deepseek-flash"
     api_key_env: str = "DEEPSEEK_API_KEY"
     timeout_seconds: int = 20
 
@@ -174,7 +189,7 @@ class AppConfig:
     """全量配置（含所有默认值，保证"缺配置也能跑基础命令"）。"""
 
     sources: dict[str, bool] = field(
-        default_factory=lambda: {"jobsdb": True, "linkedin": False, "indeed": False}
+        default_factory=lambda: {"local": True, "jobsdb": True, "linkedin": False, "indeed": False}
     )
     keywords: list[str] = field(
         # 刻意【不预置任何默认词】：关键词是「你想找什么」，只有用户自己知道，
@@ -244,7 +259,7 @@ class AppConfig:
     # ------------------------------------------------------------------
     def enabled_sources(self) -> list[str]:
         """当前启用的抓取源列表（顺序固定，便于日志对照）。"""
-        return [s for s in ("jobsdb", "linkedin", "indeed") if self.sources.get(s, False)]
+        return [s for s in ("local", "jobsdb", "linkedin", "indeed") if self.sources.get(s, False)]
 
     def all_keywords(self) -> list[str]:
         """全部待抓取关键词 = 普通关键词 + 毕业生项目关键词（顺序：普通在前）。"""

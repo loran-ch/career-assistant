@@ -14,11 +14,12 @@ from career_assistant.db import _SCHEMA as RADAR_SCHEMA
 from career_assistant.models import now_hk, to_iso
 
 UPSTREAM_COMMIT = "e2bcb2ba917644b8a88d9981d4e3eb514be98c65"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 TABLES = {
     name: f"course_{name}" for name in (
         "resumes", "resume_versions", "reports", "preferences", "job_snapshots",
         "matches", "materials", "application_events", "tasks", "email_attempts", "preparations",
+        "favorites", "tailored_resumes",
     )
 }
 TABLES["applications"] = "applications"
@@ -84,6 +85,14 @@ CREATE TABLE course_tasks (
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX course_tasks_pending ON course_tasks(status,available_at,id);
+CREATE TABLE course_tailored_resumes (
+ id INTEGER PRIMARY KEY,
+ snapshot_id INTEGER NOT NULL REFERENCES course_job_snapshots(id),
+ resume_id INTEGER REFERENCES course_resumes(id),
+ title TEXT NOT NULL,
+ body TEXT NOT NULL,
+ created_at TEXT NOT NULL
+);
 CREATE TABLE course_email_attempts (
  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES course_tasks(id),
  status TEXT NOT NULL CHECK(status IN ('preview','failed','accepted','uncertain')),
@@ -267,12 +276,12 @@ class Store:
             with self.connect() as c:
                 exists = c.execute("SELECT 1 FROM sqlite_master WHERE name='course_migrations'").fetchone()
                 if exists and (c.execute("SELECT MAX(version) FROM course_migrations").fetchone()[0] or 0) >= SCHEMA_VERSION:
-                    return self._migrate_v4()
+                    return self._migrate_v6()
         from .worker import FileLock
         lock = FileLock(Path(f"{self.path}.worker.lock"))
         lock.acquire()
         try:
-            return self._migrate_v4()
+            return self._migrate_v6()
         finally:
             lock.release()
 
@@ -343,6 +352,66 @@ class Store:
                 raise RuntimeError("v4 迁移外键校验失败")
         return first or backup
 
+    def _migrate_v5(self) -> str | None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as c:
+            exists = c.execute("SELECT 1 FROM sqlite_master WHERE name='course_migrations'").fetchone()
+            current = c.execute("SELECT MAX(version) FROM course_migrations").fetchone()[0] if exists else 0
+        if current and current > 5:
+            raise RuntimeError("数据库版本比本程序新")
+        if current == 5:
+            return None
+        first = self._migrate_v4() if current != 4 else None
+        backup = str(self.path.with_name(f"{self.path.name}.before-course-v5-{uuid.uuid4().hex[:12]}.bak")) if current == 4 else None
+        with self.connect() as c:
+            if backup:
+                with sqlite3.connect(backup) as destination:
+                    c.backup(destination)
+                    if destination.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise RuntimeError("备份校验失败")
+            c.execute("BEGIN IMMEDIATE")
+            if c.execute("SELECT 1 FROM course_migrations WHERE version=5").fetchone():
+                return first or backup
+            c.execute("CREATE TABLE IF NOT EXISTS course_favorites ("
+                      "id INTEGER PRIMARY KEY, "
+                      "job_uid TEXT NOT NULL UNIQUE REFERENCES jobs(job_uid), "
+                      "snapshot_id INTEGER NOT NULL REFERENCES course_job_snapshots(id), "
+                      "created_at TEXT NOT NULL)")
+            c.execute("INSERT INTO course_migrations VALUES(?,?,?)", (5, stamp(), UPSTREAM_COMMIT))
+            if c.execute("PRAGMA foreign_key_check").fetchall():
+                raise RuntimeError("v5 迁移外键校验失败")
+        return first or backup
+
+    def _migrate_v6(self) -> str | None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as c:
+            exists = c.execute("SELECT 1 FROM sqlite_master WHERE name='course_migrations'").fetchone()
+            current = c.execute("SELECT MAX(version) FROM course_migrations").fetchone()[0] if exists else 0
+        if current and current > SCHEMA_VERSION:
+            raise RuntimeError("数据库版本比本程序新")
+        if current == SCHEMA_VERSION:
+            return None
+        first = self._migrate_v5() if current != 5 else None
+        backup = str(self.path.with_name(f"{self.path.name}.before-course-v6-{uuid.uuid4().hex[:12]}.bak")) if current == 5 else None
+        with self.connect() as c:
+            if backup:
+                with sqlite3.connect(backup) as destination:
+                    c.backup(destination)
+                    if destination.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise RuntimeError("备份校验失败")
+            c.execute("BEGIN IMMEDIATE")
+            if c.execute("SELECT 1 FROM course_migrations WHERE version=6").fetchone():
+                return first or backup
+            c.execute("CREATE TABLE IF NOT EXISTS course_tailored_resumes ("
+                      "id INTEGER PRIMARY KEY, "
+                      "snapshot_id INTEGER NOT NULL REFERENCES course_job_snapshots(id), "
+                      "resume_id INTEGER REFERENCES course_resumes(id), "
+                      "title TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL)")
+            c.execute("INSERT INTO course_migrations VALUES(?,?,?)", (6, stamp(), UPSTREAM_COMMIT))
+            if c.execute("PRAGMA foreign_key_check").fetchall():
+                raise RuntimeError("v6 迁移外键校验失败")
+        return first or backup
+
     def cleanup_job_cache(self, *, now=None) -> int:
         """Delete only expired, unreferenced source cache in one transaction.
 
@@ -371,12 +440,15 @@ class Store:
                 AND julianday(COALESCE(last_fetched_at,first_seen_at))<=julianday(?)
                 AND NOT EXISTS(SELECT 1 FROM applications a WHERE a.job_uid=j.job_uid)
                 AND NOT EXISTS(SELECT 1 FROM user_feedback f WHERE f.job_uid=j.job_uid)
+                AND NOT EXISTS(SELECT 1 FROM course_favorites f WHERE f.job_uid=j.job_uid)
                 AND NOT EXISTS(SELECT 1 FROM course_job_snapshots s JOIN applications a
                     ON a.course_snapshot_id=s.id WHERE s.job_uid=j.job_uid)
                 AND NOT EXISTS(SELECT 1 FROM course_job_snapshots s JOIN course_matches m
                     ON m.snapshot_id=s.id WHERE s.job_uid=j.job_uid)
                 AND NOT EXISTS(SELECT 1 FROM course_job_snapshots s JOIN course_preparations p
                     ON p.snapshot_id=s.id OR p.original_snapshot_id=s.id WHERE s.job_uid=j.job_uid)
+                AND NOT EXISTS(SELECT 1 FROM course_job_snapshots s JOIN course_tailored_resumes t
+                    ON t.snapshot_id=s.id WHERE s.job_uid=j.job_uid)
                 AND NOT EXISTS(SELECT 1 FROM course_job_snapshots s WHERE s.job_uid=j.job_uid AND s.source='manual')
             """, (cutoff,)).fetchall()
             deleted = 0
@@ -557,6 +629,110 @@ class Store:
             return self._insert_on(conn, "job_snapshots", dict(
                 id=sequence, **values, fingerprint=fingerprint, created_at=stamp(),
             ))
+
+    def toggle_favorite(self, snapshot_id: int) -> bool:
+        """Bookmark one job for the personal profile; returns the new state."""
+        snapshot = self.get("job_snapshots", snapshot_id)
+        if snapshot is None:
+            raise ValueError("岗位不存在")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT id FROM course_favorites WHERE job_uid=?", (snapshot["job_uid"],)
+            ).fetchone()
+            if existing:
+                conn.execute("DELETE FROM course_favorites WHERE job_uid=?", (snapshot["job_uid"],))
+                return False
+            conn.execute(
+                "INSERT INTO course_favorites(job_uid,snapshot_id,created_at) VALUES(?,?,?)",
+                (snapshot["job_uid"], snapshot_id, stamp()),
+            )
+            return True
+
+    def is_favorite(self, job_uid: str) -> bool:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT 1 FROM course_favorites WHERE job_uid=?", (job_uid,)
+            ).fetchone() is not None
+
+    def list_favorites(self) -> list[dict]:
+        """Favorites joined to their job record for the profile page."""
+        with self.connect() as conn:
+            rows = conn.execute("""
+                SELECT f.id AS favorite_id, f.job_uid, f.snapshot_id, f.created_at,
+                       s.title AS title, s.company AS company, s.source AS source,
+                       s.url AS url, s.is_full AS is_full
+                FROM course_favorites f
+                JOIN course_job_snapshots s ON s.id=f.snapshot_id
+                ORDER BY f.created_at DESC, f.id DESC
+            """).fetchall()
+            return [dict(row) for row in rows]
+
+    def save_tailored_resume(self, snapshot_id: int, resume_id: int | None, title: str, body: str) -> int:
+        snapshot = self.get("job_snapshots", snapshot_id)
+        if not snapshot:
+            raise ValueError("岗位不存在")
+        text = (body or "").strip()
+        if len(text) < 40:
+            raise ValueError("简历正文过短，未保存")
+        if resume_id is not None:
+            if self.get("resumes", int(resume_id)) is None:
+                raise ValueError("对照简历不存在")
+        heading = (title or "").strip() or f"{snapshot['title']} · 针对性简历"
+        return self._insert("tailored_resumes", dict(
+            snapshot_id=int(snapshot_id),
+            resume_id=int(resume_id) if resume_id is not None else None,
+            title=heading[:200],
+            body=text,
+            created_at=stamp(),
+        ))
+
+    def list_tailored_resumes(self, job_uid: str) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.* FROM course_tailored_resumes t
+                JOIN course_job_snapshots s ON s.id=t.snapshot_id
+                WHERE s.job_uid=?
+                ORDER BY t.id DESC
+                """,
+                (job_uid,),
+            ).fetchall()
+            return [decode(row) for row in rows]
+
+    def tailored_resume_counts(self) -> dict[str, int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.job_uid AS job_uid, COUNT(t.id) AS n
+                FROM course_tailored_resumes t
+                JOIN course_job_snapshots s ON s.id=t.snapshot_id
+                GROUP BY s.job_uid
+                """
+            ).fetchall()
+            return {row["job_uid"]: int(row["n"]) for row in rows}
+
+    def matched_job_uids(self) -> set[str]:
+        """Job UIDs that already have at least one match analysis report."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT s.job_uid AS job_uid
+                FROM course_matches m
+                JOIN course_job_snapshots s ON s.id=m.snapshot_id
+                """
+            ).fetchall()
+            return {row["job_uid"] for row in rows}
+
+    def get_tailored_resume(self, snapshot_id: int, record_id: int) -> dict | None:
+        snapshot = self.get("job_snapshots", snapshot_id)
+        item = self.get("tailored_resumes", record_id)
+        if not snapshot or not item:
+            return None
+        owner = self.get("job_snapshots", item["snapshot_id"])
+        if not owner or owner["job_uid"] != snapshot["job_uid"]:
+            return None
+        return item
 
     def save_match(self, resume_version_id: int, snapshot_id: int, data: dict,
                    preference_id: int | None = None, task_id: int | None = None) -> int:

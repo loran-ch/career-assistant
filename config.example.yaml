@@ -3,6 +3,7 @@
 # AI and SMTP credentials come from environment variables; see .env.example.
 # No credentials or personal information belong in this template.
 sources:
+  local: true
   jobsdb: true
   linkedin: true
   indeed: true

@@ -7,6 +7,7 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 from urllib.parse import urlsplit
@@ -15,13 +16,129 @@ import uuid
 from flask import Flask, abort, flash, redirect, render_template, request, send_file, session, url_for, jsonify
 from career_assistant.config import DATA_DIR, DB_PATH
 from career_assistant.db import Database
-from career_assistant.models import JobPosting
+from career_assistant.models import JobPosting, now_hk, parse_iso
 from career_assistant.scrapers.base import BaseScraper
 from .store import Store, APPLICATION_STATUSES, stamp, encode
 from .service import require, material_markdown, queue_search
 
 LABELS = {"saved": "收藏", "preparing": "准备中", "applied": "已投递", "interview": "面试",
           "offer": "Offer", "rejected": "拒绝", "withdrawn": "撤回"}
+
+
+DATE_BUCKETS = (
+    ("today", "今天"),
+    ("yesterday", "昨天"),
+    ("week", "本周"),
+    ("older", "更早"),
+)
+
+
+def annotate_favorite(item: dict, now=None) -> dict:
+    now = now or now_hk()
+    moment = parse_iso(item.get("created_at") or "") or now
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=now.tzinfo)
+    days = (now.date() - moment.astimezone(now.tzinfo).date()).days
+    if days <= 0:
+        bucket, when = "today", "今天 " + moment.strftime("%H:%M")
+    elif days == 1:
+        bucket, when = "yesterday", "昨天"
+    elif days < 7:
+        bucket, when = "week", f"{days} 天前"
+    else:
+        bucket, when = "older", moment.strftime("%m-%d")
+    return {**item, "when_label": when, "date_bucket": bucket, "favorited_at": moment.timestamp()}
+
+
+def group_favorites_by_date(items: list[dict]) -> list[dict]:
+    groups = []
+    for key, title in DATE_BUCKETS:
+        rows = [item for item in items if item.get("date_bucket") == key]
+        if rows:
+            groups.append({"key": key, "title": title, "jobs": rows})
+    return groups
+
+
+def infer_job_type(title: str) -> str:
+    text = (title or "").lower()
+    if any(word in text for word in ("intern", "internship", "实习", "fresh grad", "graduate")):
+        return "实习／校招"
+    if any(word in text for word in ("part time", "part-time", "兼职")):
+        return "兼职"
+    return "全职"
+
+
+def infer_salary_hint(title: str, salary_text: str) -> str:
+    if (salary_text or "").strip():
+        return salary_text.strip()
+    text = (title or "").lower()
+    if any(word in text for word in ("intern", "internship", "实习")):
+        return "参考 8-15K HKD/月"
+    if any(word in text for word in ("director", "head of", "principal")):
+        return "参考 80K+ HKD/月"
+    if any(word in text for word in ("senior", "manager", "lead")):
+        return "参考 40-70K HKD/月"
+    return "参考 25-45K HKD/月"
+
+
+def card_requirement(title: str, company: str, location: str, snippet: str) -> tuple[str, bool]:
+    cleaned = re.sub(r"\s+", " ", snippet or "").strip()
+    if cleaned:
+        return cleaned[:220], True
+    place = location or "地点未注明"
+    org = company or "公司未提供"
+    role = title or "本岗位"
+    low = role.lower()
+    if any(word in low for word in ("quant", "量化", "trading", "researcher")):
+        focus = "量化研究、交易或风控相关经验；熟悉 Python / SQL、统计建模与市场数据，能独立完成分析并与业务对齐。"
+    elif any(word in low for word in ("data", "分析", "analyst", "bi")):
+        focus = "数据分析经验；熟悉 SQL、Excel 与可视化，能从业务问题出发做指标、报告和结论。"
+    elif any(word in low for word in ("engineer", "工程", "developer", "algorithm")):
+        focus = "工程或算法落地能力；熟悉常用开发与协作流程，能把方案做成可维护代码。"
+    elif any(word in low for word in ("finance", "财务", "investment", "投资", "alm")):
+        focus = "金融、投资或财务管理背景；熟悉报表与风险指标，能支持决策和跨部门沟通。"
+    else:
+        focus = "与职位方向相符的专业经验，以及清晰的书面与口头沟通能力。"
+    return f"{org} · {place}。职位：{role}。{focus}（列表未返回官方 JD，此为按职位名称整理的预览。）", False
+
+
+def job_display_fields(item: dict, job: dict | None = None) -> dict:
+    job = job or {}
+    location = (job.get("location") or "").strip()
+    salary = (job.get("salary_text") or "").strip()
+    snippet = item.get("jd") or job.get("description_snippet") or ""
+    requirement, official = card_requirement(
+        item.get("title") or "", item.get("company") or "", location, snippet)
+    return {
+        "location": location or "地点未提供",
+        "salary_text": infer_salary_hint(item.get("title") or "", salary),
+        "salary_official": bool(salary),
+        "posted_at": (job.get("posted_at") or "")[:10],
+        "requirement": requirement,
+        "requirement_official": official,
+        "job_type": infer_job_type(item.get("title") or ""),
+        "keyword_matched": (job.get("keyword_matched") or "").strip(),
+        "jd_text": (item.get("jd") or "").strip(),
+    }
+
+
+def paginate_items(items: list, arg: str, page_size: int = 8):
+    try:
+        current = int(request.args.get(arg) or 1)
+    except ValueError:
+        current = 1
+    total = len(items)
+    pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    current = min(max(1, current), pages)
+    start = (current - 1) * page_size
+    return items[start:start + page_size], current, pages, total
+
+
+def tailored_download_name(snapshot: dict, item: dict) -> str:
+    raw = f"{snapshot.get('company') or 'company'}-{snapshot.get('title') or 'resume'}-{item['id']}"
+    safe = re.sub(r'[\\/:*?"<>|]+', "-", raw)
+    safe = re.sub(r"\s+", "-", safe).strip("-.")[:80]
+    return f"{safe or 'resume'}.md"
 
 
 def create_app(store=None, data_dir=None, testing=False):
@@ -51,8 +168,10 @@ def create_app(store=None, data_dir=None, testing=False):
         if "csrf" not in session:
             session["csrf"] = secrets.token_hex(32)
         if request.method == "POST":
-            supplied = request.form.get("csrf", "")
-            if not secrets.compare_digest(supplied, session["csrf"]):
+            supplied = request.form.get("csrf") or request.headers.get("X-CSRF") or ""
+            if request.is_json:
+                supplied = supplied or str((request.get_json(silent=True) or {}).get("csrf") or "")
+            if not secrets.compare_digest(str(supplied), session["csrf"]):
                 abort(403)
 
     @app.after_request
@@ -70,7 +189,9 @@ def create_app(store=None, data_dir=None, testing=False):
     @app.errorhandler(ValueError)
     def invalid(exc):
         target = request.form.get("return_to", "")
-        if target.startswith(("/jobs", "/profile", "/preferences", "/applications/", "/materials/")) and not target.startswith("//") and "?" not in target:
+        if request.path.startswith("/assistant") and (request.is_json or request.accept_mimetypes.best == "application/json"):
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        if target.startswith(("/jobs", "/assistant", "/profile", "/preferences", "/applications/", "/materials/")) and not target.startswith("//") and "?" not in target:
             session["form_error"] = str(exc)
             session["form_values"] = {k: v for k, v in request.form.items() if k not in {"csrf"}}
             return redirect(target)
@@ -87,7 +208,7 @@ def create_app(store=None, data_dir=None, testing=False):
     def task_redirect(task_id):
         item = require(store, "tasks", task_id)
         if item["kind"] == "search":
-            return redirect(url_for("jobs", task=task_id))
+            return redirect(url_for("jobs", task=task_id, _anchor="search-results"))
         if item["kind"] == "materials":
             match = require(store, "matches", item["payload"]["match_id"])
             return redirect(url_for("job_detail", snapshot_id=match["snapshot_id"], task=task_id, match=match["id"]))
@@ -114,9 +235,26 @@ def create_app(store=None, data_dir=None, testing=False):
 
     @app.get("/profile")
     def profile():
-        return render_template("page.html", page="home", preparations=store.list("preparations"), resumes=store.list("resumes"),
+        favorites = store.list_favorites()
+        tailored = store.tailored_resume_counts()
+        matched = store.matched_job_uids()
+        pending = [item for item in favorites if not tailored.get(item["job_uid"])]
+        reports = [item for item in favorites if item["job_uid"] in matched]
+        fav = request.args.get("fav") or "pending"
+        if fav not in {"pending", "reports"}:
+            fav = "pending"
+        pool = pending if fav == "pending" else reports
+        listed, fav_page, fav_pages, fav_total = paginate_items(pool, "p")
+        return render_template(
+            "page.html", page="home",
+            preparations=store.list("preparations"), resumes=store.list("resumes"),
             versions=store.list("resume_versions"), preferences=store.list("preferences"),
-            tasks=store.list("tasks")[:20], applications=store.list("applications"), matches=store.list("matches"))
+            tasks=store.list("tasks")[:20], applications=store.list("applications"),
+            matches=store.list("matches"),
+            favorites=favorites, listed_favorites=listed,
+            pending_favorites=pending, report_favorites=reports,
+            fav_filter=fav, fav_page=fav_page, fav_pages=fav_pages, fav_total=fav_total,
+        )
 
     @app.post("/resumes")
     def upload():
@@ -193,7 +331,7 @@ def create_app(store=None, data_dir=None, testing=False):
                 raise ValueError("当前 Radar 免费基线最多 7 个关键词")
             if not set(types).issubset({"internship", "part time", "full time"}):
                 raise ValueError("未知岗位类型")
-            if not set(sources).issubset({"jobsdb", "indeed", "linkedin"}):
+            if not set(sources).issubset({"local", "jobsdb", "indeed", "linkedin"}):
                 raise ValueError("未知岗位来源")
             data = dict(confirmed=True, keywords=keywords, location=location, job_types=types, sources=sources)
             pid = existing[0]["id"] if existing and existing[0]["data"] == data else store.confirm_preferences(None, data)
@@ -210,13 +348,34 @@ def create_app(store=None, data_dir=None, testing=False):
 
     @app.get("/jobs")
     def jobs():
-        query = request.args.get("q", "").casefold()
         snapshots = list({j["job_uid"]: j for j in reversed(store.list("job_snapshots"))}.values())
-        if query:
-            snapshots = [j for j in snapshots if query in (j["title"] + j["company"] + j["jd"]).casefold()]
-        return render_template("workspace.html", page="jobs", jobs=snapshots, preferences=store.list("preferences"),
+        task = store.get("tasks", int(request.args.get("task") or 0))
+        result_uids = set()
+        if task and task["kind"] == "search":
+            uid_by_id = {j["id"]: j["job_uid"] for j in store.list("job_snapshots")}
+            result_uids = {uid_by_id[sid] for sid in (task.get("result") or {}).get("snapshot_ids", [])
+                           if sid in uid_by_id}
+        result_jobs = [j for j in snapshots if j["job_uid"] in result_uids]
+        other_jobs = [j for j in snapshots if j["job_uid"] not in result_uids]
+        favorites = {item["job_uid"] for item in store.list("favorites")}
+        searching = bool(task and task["kind"] == "search")
+        listed, listed_page, listed_pages, listed_total = paginate_items(
+            result_jobs if searching else snapshots, "p")
+        saved, saved_page, saved_pages, saved_total = paginate_items(other_jobs, "s")
+
+        def enrich_cards(items):
+            cards = []
+            for item in items:
+                cards.append({**item, **job_display_fields(item, store.get("jobs", item["job_uid"]))})
+            return cards
+
+        listed, saved = enrich_cards(listed), enrich_cards(saved)
+        return render_template("workspace.html", page="jobs", jobs=snapshots, result_jobs=result_jobs,
+            listed=listed, listed_page=listed_page, listed_pages=listed_pages, listed_total=listed_total,
+            other_jobs=saved, saved_page=saved_page, saved_pages=saved_pages, saved_total=saved_total,
+            preferences=store.list("preferences"),
             capabilities=__import__("career_assistant.integrations", fromlist=["SOURCE_CAPABILITIES"]).SOURCE_CAPABILITIES,
-            task=store.get("tasks", int(request.args.get("task") or 0)))
+            favorites=favorites, task=task)
 
     @app.post("/search")
     def search():
@@ -313,6 +472,16 @@ def create_app(store=None, data_dir=None, testing=False):
             versions=store.list("resume_versions"), materials=store.list("materials"),
             events=store.list("application_events", application_id=application_id))
 
+    @app.post("/jobs/<int:snapshot_id>/favorite")
+    def toggle_favorite(snapshot_id):
+        require(store, "job_snapshots", snapshot_id)
+        favorited = store.toggle_favorite(snapshot_id)
+        flash("已收藏到我的资料" if favorited else "已取消收藏")
+        target = request.form.get("return_to", "")
+        if target.startswith("/jobs") or target.startswith("/profile"):
+            return redirect(target)
+        return redirect(url_for("jobs"))
+
     @app.post("/jobs/<int:snapshot_id>/application")
     def application_from_job(snapshot_id):
         status, note = request.form.get("status", "saved"), request.form.get("note", "")
@@ -381,6 +550,92 @@ def create_app(store=None, data_dir=None, testing=False):
             raise ValueError("结果不确定；请检查外部结果后确认重试，可能重复发送")
         return task_redirect(store.retry(task_id))
 
+    def _assistant_selected():
+        allowed = {item["snapshot_id"] for item in store.list_favorites()}
+        selected = [int(i) for i in (session.get("assistant_jobs") or []) if int(i) in allowed]
+        session["assistant_jobs"] = selected
+        return selected
+
+    @app.get("/assistant")
+    def assistant():
+        resume_id = session.get("assistant_resume_id") or session.get("resume_id")
+        favorites = [annotate_favorite(item) for item in store.list_favorites()]
+        counts = store.tailored_resume_counts()
+        pending = [item for item in favorites if not counts.get(item["job_uid"])]
+        ready = [item for item in favorites if counts.get(item["job_uid"])]
+        return render_template(
+            "workspace.html",
+            page="assistant",
+            favorites=favorites,
+            pending_jobs=pending,
+            ready_jobs=ready,
+            pending_groups=group_favorites_by_date(pending),
+            ready_groups=group_favorites_by_date(ready),
+            tailored_counts=counts,
+            selected_jobs=_assistant_selected(),
+            resumes=store.list("resumes"),
+            selected_resume=resume_id,
+            messages=session.get("assistant_chat") or [],
+            ai_ready=all(os.environ.get(k) for k in ("RADAR_AI_API_KEY", "RADAR_AI_MODEL", "RADAR_AI_BASE_URL")),
+        )
+
+    @app.post("/assistant/select")
+    def assistant_select():
+        data = request.get_json(silent=True) or {}
+        allowed = {item["snapshot_id"] for item in store.list_favorites()}
+        raw = data.get("snapshot_ids", [])
+        if isinstance(raw, str):
+            raw = [part for part in raw.split(",") if part.strip()]
+        selected = []
+        for value in raw or []:
+            try:
+                snapshot_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if snapshot_id in allowed:
+                selected.append(snapshot_id)
+        session["assistant_jobs"] = selected
+        resume_id = data.get("resume_id")
+        if resume_id not in (None, ""):
+            resume = require(store, "resumes", int(resume_id))
+            session["assistant_resume_id"] = resume["id"]
+            session["resume_id"] = resume["id"]
+        return jsonify({"ok": True, "count": len(selected)})
+
+    @app.post("/assistant/chat")
+    def assistant_chat():
+        from career_assistant.ai import AIError
+        from career_assistant.assistant_agent import run_assistant
+        data = request.get_json(silent=True) or {}
+        message = str(data.get("message") or "").strip()
+        if not message:
+            return jsonify({"ok": False, "error": "请输入问题或任务说明。"}), 400
+        selected = _assistant_selected()
+        resume_id = session.get("assistant_resume_id") or session.get("resume_id")
+        history = [
+            {"role": item["role"], "content": item["content"]}
+            for item in (session.get("assistant_chat") or [])[-12:]
+            if item.get("role") in {"user", "assistant"} and item.get("content")
+        ]
+        try:
+            reply, found = run_assistant(
+                store, message, selected, resume_id, history,
+                search_ids=session.get("assistant_search_jobs") or [],
+            )
+        except AIError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        if found:
+            session["assistant_search_jobs"] = found
+        chat = list(session.get("assistant_chat") or [])
+        chat.extend([{"role": "user", "content": message}, {"role": "assistant", "content": reply}])
+        session["assistant_chat"] = chat[-20:]
+        return jsonify({"ok": True, "reply": reply})
+
+    @app.post("/assistant/clear")
+    def assistant_clear():
+        session["assistant_chat"] = []
+        return jsonify({"ok": True})
+
     @app.get("/applications")
     def applications():
         return render_template("workspace.html", page="applications", applications=store.list("applications"))
@@ -428,13 +683,39 @@ def create_app(store=None, data_dir=None, testing=False):
                  or (t["kind"] == "email" and t["payload"].get("type") == "match" and match and t["payload"].get("id") == match["id"])
                  or (t["kind"] == "analyze" and preparation and t["payload"].get("resume_id") == preparation["resume_id"])]
         tasks = list({t["kind"]: t for t in reversed(tasks)}.values())
+        job = store.get("jobs", snapshot["job_uid"])
         args = dict(snapshot=snapshot, history=history, preparation=preparation, match=match, matches=matches,
+            job=job, intro=job_display_fields(snapshot, job),
+            favorited=store.is_favorite(snapshot["job_uid"]),
             facts_available=bool(preparation and preparation["resume_version_id"]), tasks=tasks, materials=store.list("materials", match_id=match["id"]) if match else [],
             resumes=store.list("resumes"), selected_resume=session.get("resume_id"), preferences=store.list("preferences"),
-            applications=store.list("applications", job_uid=snapshot["job_uid"]))
+            applications=store.list("applications", job_uid=snapshot["job_uid"]),
+            tailored_resumes=store.list_tailored_resumes(snapshot["job_uid"]))
         if request.args.get("fragment"):
             return render_template("job_progress.html", **args)
         return render_template("workspace.html", page="job", **args)
+
+    @app.get("/jobs/<int:snapshot_id>/resumes/<int:record_id>")
+    def tailored_resume(snapshot_id, record_id):
+        snapshot = require(store, "job_snapshots", snapshot_id)
+        item = store.get_tailored_resume(snapshot_id, record_id)
+        if not item:
+            abort(404)
+        return render_template("workspace.html", page="tailored_resume", snapshot=snapshot, item=item)
+
+    @app.get("/jobs/<int:snapshot_id>/resumes/<int:record_id>/download")
+    def download_tailored_resume(snapshot_id, record_id):
+        snapshot = require(store, "job_snapshots", snapshot_id)
+        item = store.get_tailored_resume(snapshot_id, record_id)
+        if not item:
+            abort(404)
+        payload = (item["body"] or "").encode("utf-8")
+        return send_file(
+            io.BytesIO(payload),
+            mimetype="text/markdown; charset=utf-8",
+            as_attachment=True,
+            download_name=tailored_download_name(snapshot, item),
+        )
 
     @app.post("/tasks/<int:task_id>/inputs")
     def material_inputs(task_id):

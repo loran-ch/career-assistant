@@ -1,34 +1,156 @@
 <!doctype html><html lang="zh-Hans"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>INT6181 · 求职助手</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='workspace.css') }}"></head><body>
-<header><strong>Career Assistant · 智能求职助手</strong><nav><a href="/jobs">岗位</a><a href="/applications">申请</a><a href="/profile">我的资料</a><a href="/settings">设置</a></nav></header><main>{% for message in get_flashed_messages() %}<p class="notice">{{message}}</p>{% endfor %}{% if session.get("form_error") %}<p class="notice" role="alert">{{session.pop("form_error")}}</p>{% endif %}
-{% from 'page.html' import token, resume_select, preference_select with context %}
+<header><strong>Career Assistant · 智能求职助手</strong><nav><a href="/jobs">岗位</a><a href="/assistant">AI助手</a><a href="/applications">申请</a><a href="/profile">我的资料</a><a href="/settings">设置</a></nav></header><main>{% for message in get_flashed_messages() %}<p class="notice">{{message}}</p>{% endfor %}{% if session.get("form_error") %}<p class="notice" role="alert">{{session.pop("form_error")}}</p>{% endif %}
+{% from 'page.html' import token, resume_select, preference_select, location_select with context %}
 {% if page=='jobs' %}
+{% macro job_card(j) %}<article class="job-card">
+<div class="job-card-head">
+<h2><a href="/jobs/{{j.id}}">{{j.title}}</a></h2>
+<form action="/jobs/{{j.id}}/favorite" method="post">{{token(request.full_path.rstrip('?') ~ '#search-results')}}<button>{{'★ 已收藏' if j.job_uid in favorites else '☆ 收藏'}}</button></form>
+</div>
+<p class="job-company">{{j.company or '公司未提供'}} · {{'用户提供' if j.source=='manual' else ('本地数据' if j.source=='local' else j.source)}}</p>
+<ul class="job-tags">
+<li>{{j.location or '地点未提供'}}</li>
+<li>{{j.salary_text}}{% if not j.salary_official %} · 非官方{% endif %}</li>
+<li>{{j.job_type}}</li>
+<li>{{'完整 JD' if j.is_full else '列表摘要'}}</li>
+{% if j.posted_at %}<li>{{j.posted_at}}</li>{% endif %}
+{% if j.keyword_matched %}<li>匹配 {{j.keyword_matched}}</li>{% endif %}
+</ul>
+<p class="job-req"><strong>{{'岗位需求' if j.requirement_official else '需求预览'}}</strong> {{j.requirement}}{% if j.requirement_official and j.requirement|length >= 220 %}…{% endif %}</p>
+</article>{% endmacro %}
+{% set searching = task and task.kind=='search' %}
+{% macro jobs_href(p=listed_page, s=saved_page, anchor='search-results') %}{% if task %}{{ url_for('jobs', task=task.id, p=p, s=s, _anchor=anchor) }}{% else %}{{ url_for('jobs', p=p, s=s, _anchor=anchor) }}{% endif %}{% endmacro %}
+{% macro pager(current, pages, which) %}{% if pages>1 %}<nav class="pager" aria-label="分页">{% if current>1 %}<a class="button" href="{% if which=='listed' %}{{ jobs_href(p=current-1) }}{% else %}{{ jobs_href(s=current-1, anchor='saved-jobs') }}{% endif %}">上一页</a>{% endif %}<span>第 {{current}} / {{pages}} 页</span>{% if current<pages %}<a class="button" href="{% if which=='listed' %}{{ jobs_href(p=current+1) }}{% else %}{{ jobs_href(s=current+1, anchor='saved-jobs') }}{% endif %}">下一页</a>{% endif %}</nav>{% endif %}{% endmacro %}
 <h1>岗位</h1><p class="muted">浏览和刷新读取本地记录。普通岗位缓存自最近成功获取起保留 30 天；收藏及已有分析、材料、申请或待办依据会保留。缓存期限不代表招聘截止日期，实际截止时间以招聘方信息为准。</p>
-<section><h2>找工作</h2><p>无需简历或 AI 即可搜索、浏览和收藏。</p>
+<section id="search-results"><h2>找工作</h2><p>无需简历或 AI 即可搜索、浏览和收藏。填写条件后点“开始搜索”，结果会显示在下方，不必再检索一次。</p>
 {% set data=preferences[0].data if preferences else {} %}
-<form action="/preferences" method="post">{{token()}}
+<form id="search-form" action="/preferences" method="post">{{token()}}
 <label>目标职位（每行一个，最多 7 个）<textarea name="keywords" required>{{data.get('keywords',[])|join('\n')}}</textarea></label>
-<label>地区<input name="location" value="{{data.get('location','Hong Kong')}}" required></label>
+{{ location_select(data.get('location','Hong Kong')) }}
 {% for value,label in [('internship','实习'),('part time','兼职'),('full time','全职')] %}<label><input type="checkbox" name="job_types" value="{{value}}" {% if value in data.get('job_types',[]) %}checked{% endif %}>{{label}}</label>{% endfor %}
-{% for source in ['linkedin','jobsdb','indeed'] %}<label><input type="checkbox" name="sources" value="{{source}}" {% if source in data.get('sources',[]) %}checked{% endif %}>{{source}} · 列表支持 · {{'详情支持' if capabilities[source].details else '详情需手动补全'}} · {{capabilities[source].verification}}</label>{% endfor %}
-<button>开始搜索</button></form></section>
-{% if task %}<section data-poll="/tasks/{{task.id}}/status">{% include 'task_progress.html' %}</section>{% endif %}
+{% for source,label in [('local','本地岗位数据'),('linkedin','linkedin'),('jobsdb','jobsdb'),('indeed','indeed')] %}<label><input type="checkbox" name="sources" value="{{source}}" {% if source=='local' or source in data.get('sources',['local','linkedin']) %}checked{% endif %}>{{label}} · 列表支持 · {{'详情支持' if capabilities[source].details else '详情需手动补全'}} · {{capabilities[source].verification}}</label>{% endfor %}
+<p class="muted">至少选择一种岗位类型和来源。当前本机实测：LinkedIn 列表可用；JobsDB、Indeed 可能返回访问限制。</p>
+<button id="search-submit">开始搜索</button></form>
+<h3>搜索结果 <span class="badge">{{ listed_total }}</span></h3>
+{% if task %}<div data-poll="/tasks/{{task.id}}/status"{% if task.status in ['queued','running'] %} data-reload-on="succeeded,failed,uncertain"{% endif %}>{% include 'task_progress.html' %}</div>{% endif %}
+{% if searching and task.status in ['queued','running'] %}<p class="muted">正在获取岗位；完成后本页会自动刷新并显示结果。</p>{% endif %}
+{% for j in listed %}{{ job_card(j) }}{% else %}
+{% if searching and task.status in ['queued','running'] %}<p class="muted">搜索进行中，暂无结果。</p>
+{% elif searching %}<p>本次搜索没有返回可展示的岗位；请查看上方各来源状态或重试。</p>
+{% else %}<p>尚未搜索或保存岗位。填写目标职位并选择来源后点击“开始搜索”。</p>{% endif %}
+{% endfor %}
+{% if listed_total %}{{ pager(listed_page, listed_pages, 'listed') }}{% endif %}
+</section>
 <section><h2>分析已有岗位</h2><form action="/jobs" method="post">{{token()}}
 <label>职位<input name="title" required></label><label>公司（可留空）<input name="company"></label>
 <label>原岗位链接（可留空）<input name="url" type="url"></label><label>完整 JD<textarea name="jd"></textarea></label>
 <input type="hidden" name="is_full" value="yes"><button>导入岗位</button></form></section>
-<form method="get"><label>检索已有岗位<input name="q" value="{{request.args.get('q','')}}"></label><button>检索</button></form>
-{% for j in jobs %}<article><h2><a href="/jobs/{{j.id}}">{{j.title}}</a></h2><p>{{j.company or '公司未提供'}} · {{'用户提供' if j.source=='manual' else j.source}} · {{'完整 JD' if j.is_full else '摘要，需补全'}}</p>
-<form action="/jobs/{{j.id}}/application" method="post">{{token()}}<input type="hidden" name="status" value="saved"><button>收藏</button></form></article>{% else %}<p>尚未保存岗位。</p>{% endfor %}
+{% if searching and saved_total %}<section id="saved-jobs"><h2>其他已保存岗位 <span class="badge">{{ saved_total }}</span></h2>{% for j in other_jobs %}{{ job_card(j) }}{% endfor %}{{ pager(saved_page, saved_pages, 'saved') }}</section>{% endif %}
 {% elif page=='job' %}
-<h1>{{snapshot.title}}</h1><p>{{snapshot.company or '公司未提供'}} · {{'用户提供' if snapshot.source=='manual' else snapshot.source}}</p>
+<h1>{{snapshot.title}}</h1><p>{{snapshot.company or '公司未提供'}} · {{'用户提供' if snapshot.source=='manual' else ('本地数据' if snapshot.source=='local' else snapshot.source)}}</p>
+<form action="/jobs/{{snapshot.id}}/favorite" method="post">{{token(request.full_path.rstrip('?'))}}<button>{{'★ 已收藏' if favorited else '☆ 收藏到我的资料'}}</button></form>
 {% if snapshot.url %}<a href="{{snapshot.url}}" target="_blank" rel="noopener">原岗位链接，自行投递</a>{% else %}<p>未提供原岗位链接；仍可分析和记录申请。</p>{% endif %}
+<section><h2>岗位介绍</h2>
+<ul class="job-tags">
+<li>{{intro.location}}</li>
+<li>{{intro.salary_text}}{% if not intro.salary_official %} · 非官方{% endif %}</li>
+<li>{{intro.job_type}}</li>
+<li>{{'完整 JD' if snapshot.is_full else '列表摘要'}}</li>
+{% if intro.posted_at %}<li>{{intro.posted_at}}</li>{% endif %}
+{% if intro.keyword_matched %}<li>匹配 {{intro.keyword_matched}}</li>{% endif %}
+</ul>
+{% if intro.jd_text %}
+<pre>{{intro.jd_text}}</pre>
+{% else %}
+<p class="job-req"><strong>需求预览</strong> {{intro.requirement}}</p>
+<p class="muted">与列表卡片相同。招聘网站列表未返回官方 JD，所以详情也不会凭空出现介绍。可打开原岗位链接核对，或在下方「JD 原文与历史」粘贴完整描述。</p>
+{% endif %}
+</section>
+<section><h2>针对性简历</h2>
+<p class="muted">由 AI 助手按本岗位生成。到「AI助手」勾选该岗位后可批量生成；未勾选则不会出现在这里。</p>
+{% for r in tailored_resumes %}
+<article>
+<h3>{{r.title}}</h3>
+<p class="muted">{{r.created_at[:16].replace('T',' ')}}</p>
+<p><a class="button" href="/jobs/{{snapshot.id}}/resumes/{{r.id}}">查看</a>
+<a class="button" href="/jobs/{{snapshot.id}}/resumes/{{r.id}}/download">下载</a></p>
+</article>
+{% else %}
+<p>尚未生成本岗位简历。打开<a href="/assistant">AI助手</a>，勾选本岗位后选择「为每个勾选岗位各生成一版针对性简历」。</p>
+{% endfor %}
+</section>
 <section><form action="/jobs/{{snapshot.id}}/prepare" method="post">{{token()}}{{resume_select(resumes,selected_resume)}}{{preference_select(preferences)}}<button>分析岗位</button></form></section>
 <div id="job-progress" data-poll="{{request.path}}?fragment=progress{% if request.args.get('match') %}&match={{request.args.get('match')}}{% endif %}">{% include 'job_progress.html' %}</div>
 <section><h2>申请</h2>{% for a in applications %}<p><a href="/applications/{{a.id}}">{{labels.get(a.status,a.status)}} · 查看时间线</a></p>{% endfor %}
 <form action="/jobs/{{snapshot.id}}/application" method="post">{{token()}}<label>申请状态<select name="status">{% for key,label in labels.items() %}<option value="{{key}}">{{label}}</option>{% endfor %}</select></label><label>日期<input type="date" name="event_date"></label><label>备注／自有材料说明<textarea name="note"></textarea></label><button>保存申请记录</button></form></section>
 <details><summary>JD 原文与历史</summary><form action="/jobs/{{snapshot.id}}/complete" method="post">{{token()}}<label>修改完整 JD（保存为新版本）<textarea name="jd" required>{{snapshot.jd}}</textarea></label><button>保存 JD 新版本</button></form>{% for j in history %}<h3>{{'完整 JD' if j.is_full else '摘要'}} · {{j.created_at}}</h3><pre>{{j.jd}}</pre>{% endfor %}</details>
 <details><summary>匹配历史与依据</summary>{% for m in matches %}<p><a href="?match={{m.id}}">{{m.created_at}} 的分析</a> · 事实 {{m.resume_version_id}} · JD {{m.snapshot_id}} · 偏好 {{m.preference_id or '未设置'}}</p>{% endfor %}</details>
+{% elif page=='tailored_resume' %}
+<h1>{{item.title}}</h1>
+<p class="muted">对应岗位：<a href="/jobs/{{snapshot.id}}">{{snapshot.title}}</a> · {{snapshot.company or '公司未提供'}} · {{item.created_at[:16].replace('T',' ')}}</p>
+<p><a class="button" href="/jobs/{{snapshot.id}}/resumes/{{item.id}}/download">下载 Markdown</a></p>
+<section><h2>简历正文</h2><pre>{{item.body}}</pre></section>
+<p><a href="/jobs/{{snapshot.id}}">返回岗位</a></p>
+{% elif page=='assistant' %}
+<h1>AI 助手</h1>
+<p class="muted">基于 Deep Agent。只有左侧<strong>勾选</strong>的收藏岗位会进入助手可见范围；未勾选的收藏 JD 不会发给模型。也可让助手结合简历搜索网上岗位并推荐；搜索到的岗位会保存到「岗位」页。</p>
+{% if not ai_ready %}<p class="notice" role="alert">未配置 RADAR_AI_API_KEY、RADAR_AI_BASE_URL、RADAR_AI_MODEL，发送后会提示配置错误。到「设置」查看说明。</p>{% endif %}
+<div class="assistant-layout">
+<section class="assistant-jobs">
+<h2>点选可见岗位</h2>
+<p class="muted">列表来自收藏。用下方按钮切换只看<strong>未生成</strong>或<strong>已生成</strong>的岗位，组内按最新收藏排列。请优先在未生成列表中勾选，避免重复消耗算力。</p>
+{% if favorites %}
+{% macro favorite_row(f, group) %}<label data-created="{{ '%.0f'|format(f.favorited_at) }}" data-group="{{group}}"><input type="checkbox" name="snapshot_ids" value="{{f.snapshot_id}}" data-group="{{group}}" {% if f.snapshot_id in selected_jobs %}checked{% endif %}><span><a href="/jobs/{{f.snapshot_id}}">{{f.title}}</a><br><small>{{f.company or '公司未提供'}} · {{'本地数据' if f.source=='local' else f.source}} · 收藏 {{f.when_label}}{% if group=='ready' %} · 已有简历 {{ tailored_counts.get(f.job_uid, 0) }} 份{% endif %}</small></span></label>{% endmacro %}
+{% macro date_groups(groups, group, empty) %}
+{% for section in groups %}
+<div class="assistant-date-bucket" data-rank="{{loop.index0}}">
+<h4>{{section.title}}</h4>
+{% for f in section.jobs %}{{ favorite_row(f, group) }}{% endfor %}
+</div>
+{% else %}<p class="muted">{{empty}}</p>{% endfor %}
+{% endmacro %}
+<form id="assistant-select-form">
+<div class="assistant-filter" role="tablist" aria-label="按是否已生成简历筛选">
+<button type="button" data-filter-group="pending" aria-pressed="true">未生成 <span class="badge">{{ pending_jobs|length }}</span></button>
+<button type="button" data-filter-group="ready" aria-pressed="false">已生成 <span class="badge">{{ ready_jobs|length }}</span></button>
+</div>
+<div class="assistant-job-toolbar">
+<button type="button" id="assistant-select-all">全选当前</button>
+<button type="button" id="assistant-select-none">取消当前</button>
+<button type="button" class="hint" id="assistant-sort-new" aria-pressed="true">最新收藏</button>
+<button type="button" class="hint" id="assistant-sort-old" aria-pressed="false">最早收藏</button>
+</div>
+<div class="assistant-job-list" id="assistant-job-list">
+<div class="assistant-job-group" data-group="pending">
+{{ date_groups(pending_groups, 'pending', '收藏岗位都已有针对性简历。') }}
+</div>
+<div class="assistant-job-group" data-group="ready" hidden>
+<p class="muted">可到岗位页查看或下载，不必再让助手生成。</p>
+{{ date_groups(ready_groups, 'ready', '还没有生成过针对性简历。') }}
+</div>
+</div>
+<label>对照简历<select id="assistant-resume" name="resume_id">{% for r in resumes %}<option value="{{r.id}}" {% if r.id==selected_resume %}selected{% endif %}>{{r.filename}} · #{{r.id}}</option>{% else %}<option value="">尚未上传简历</option>{% endfor %}</select></label>
+<p id="assistant-select-status" class="muted">已点选 {{ selected_jobs|length }} 个岗位</p>
+</form>
+{% else %}
+<p>还没有收藏岗位。<a href="/jobs">到岗位页收藏</a>后再回来勾选。</p>
+{% endif %}
+<p class="muted">{% if resumes %}当前简历：{% if selected_resume %}#{{selected_resume}}{% else %}未选择{% endif %}{% else %}请先到<a href="/profile">我的资料</a>上传简历。{% endif %}</p>
+</section>
+<section>
+<h2>对话</h2>
+<div id="chat-log" class="chat-log" aria-live="polite">{% for m in messages %}<div class="msg"><div class="role">{{'你' if m.role=='user' else '助手'}}</div><div class="bubble">{{m.content}}</div></div>{% else %}<p class="muted">可先勾选岗位，或让助手结合简历搜索网上岗位并推荐。</p>{% endfor %}</div>
+<p class="muted">快捷：</p>
+<p class="assistant-hints">{% for hint in ['结合我的简历搜索网上岗位并给出推荐','对照简历分析已勾选岗位的匹配度','列出缺口技能，不要编造经历','为每个勾选岗位各生成一版针对性简历并保存到对应岗位页','按勾选岗位写一封简短求职信'] %}<button type="button" class="hint" data-hint="{{hint}}">{{hint}}</button>{% endfor %}</p>
+<form id="assistant-form">
+<label>你的要求<textarea id="assistant-input" name="message" required placeholder="说明要分析哪些岗位、或要生成什么材料"></textarea></label>
+<button id="assistant-send" type="submit">发送</button>
+<button id="assistant-clear" type="button">清空对话</button>
+</form>
+<p id="assistant-status" class="muted"></p>
+</section>
+</div>
 {% elif page=='applications' %}<h1>申请</h1><p><a href="/jobs">从已有岗位建立记录，或导入岗位补记外部投递</a></p>{% for a in applications %}<article><a href="/applications/{{a.id}}">{{a.title}} · {{a.company}}</a><p>{{labels.get(a.status,a.status)}}</p></article>{% else %}<p>暂无申请记录。</p>{% endfor %}
 {% elif page=='settings' %}<h1>设置</h1>
 <section><h2>每日岗位邮件汇总</h2><form method="post" action="/settings/digest">{{token()}}<label><input type="checkbox" name="enabled" value="yes" {% if digest.enabled %}checked{% endif %}>启用每日邮件</label><label>每日时间（Asia/Hong_Kong）<input type="time" name="time" value="{{digest.time}}" required></label><button>保存推送设置</button></form>
@@ -37,9 +159,133 @@
 </main><script>
 document.querySelectorAll('[data-poll]').forEach(el=>{
  let dirty=false;el.addEventListener('input',()=>dirty=true);
- async function refresh(){if(dirty||el.contains(document.activeElement))return;try{let r=await fetch(el.dataset.poll);if(r.ok){let text=await r.text();if(text!==el.innerHTML)el.innerHTML=text}}catch(e){}}
+ async function refresh(){
+  if(dirty||el.contains(document.activeElement))return;
+  try{
+   let r=await fetch(el.dataset.poll);
+   if(r.ok){
+    let text=await r.text();
+    if(text!==el.innerHTML){
+     el.innerHTML=text;
+     const statusEl=el.querySelector('[data-task-status]');
+     if(el.dataset.reloadOn&&statusEl&&el.dataset.reloadOn.split(',').includes(statusEl.dataset.taskStatus)){location.reload();return}
+    }
+   }
+  }catch(e){}
+ }
  setInterval(refresh,1500);
 });
+const searchForm=document.getElementById('search-form');
+if(searchForm){searchForm.addEventListener('submit',e=>{
+ if(!searchForm.querySelector('input[name="job_types"]:checked')){e.preventDefault();alert('请至少选择一种岗位类型（实习／兼职／全职）。');return}
+ if(!searchForm.querySelector('input[name="sources"]:checked')){e.preventDefault();alert('请至少选择一个岗位来源；推荐先选 LinkedIn。');return}
+ const b=document.getElementById('search-submit');if(b){b.disabled=true;b.textContent='正在创建搜索任务…'}
+})}
 const saved={{session.pop('form_values',{})|tojson}};
 for(const [key,value] of Object.entries(saved)){document.querySelectorAll('[name="'+key+'"]').forEach(el=>{if(!['hidden','checkbox','file'].includes(el.type))el.value=value})}
+const csrf={{ csrf|tojson }};
+async function assistantSelect(){
+ const form=document.getElementById('assistant-select-form');
+ if(!form)return;
+ const ids=[...form.querySelectorAll('input[name=snapshot_ids]:checked')].map(el=>Number(el.value));
+ const resume=document.getElementById('assistant-resume');
+ const r=await fetch('/assistant/select',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({csrf,snapshot_ids:ids,resume_id:resume&&resume.value?Number(resume.value):null})});
+ const data=await r.json();
+ const st=document.getElementById('assistant-select-status');
+ if(st)st.textContent=data.ok?'已点选 '+data.count+' 个岗位，未勾选的岗位助手看不到':'保存点选失败';
+}
+const selectForm=document.getElementById('assistant-select-form');
+if(selectForm)selectForm.addEventListener('change',assistantSelect);
+function currentAssistantGroup(){
+ const visible=document.querySelector('.assistant-job-group:not([hidden])');
+ return visible&&visible.dataset.group;
+}
+function showAssistantGroup(name){
+ document.querySelectorAll('.assistant-job-group').forEach(el=>{el.hidden=el.dataset.group!==name});
+ document.querySelectorAll('[data-filter-group]').forEach(btn=>{
+  btn.setAttribute('aria-pressed', btn.dataset.filterGroup===name?'true':'false');
+ });
+}
+document.querySelectorAll('[data-filter-group]').forEach(btn=>{
+ btn.addEventListener('click',()=>showAssistantGroup(btn.dataset.filterGroup));
+});
+function setAssistantChecks(on, group){
+ const form=document.getElementById('assistant-select-form');
+ if(!form)return;
+ const target=group||currentAssistantGroup();
+ const nodes=target
+  ? form.querySelectorAll('input[name=snapshot_ids][data-group="'+target+'"]')
+  : form.querySelectorAll('input[name=snapshot_ids]');
+ nodes.forEach(el=>{el.checked=on});
+ assistantSelect();
+}
+const selectAll=document.getElementById('assistant-select-all');
+if(selectAll)selectAll.addEventListener('click',()=>setAssistantChecks(true));
+const selectNone=document.getElementById('assistant-select-none');
+if(selectNone)selectNone.addEventListener('click',()=>setAssistantChecks(false));
+function sortAssistantJobs(dir){
+ document.querySelectorAll('.assistant-job-group').forEach(group=>{
+  const buckets=[...group.querySelectorAll('.assistant-date-bucket')];
+  buckets.sort((a,b)=>(Number(a.dataset.rank)-Number(b.dataset.rank))*(dir==='new'?1:-1));
+  buckets.forEach(bucket=>{
+   const rows=[...bucket.querySelectorAll('label')];
+   rows.sort((a,b)=>(Number(b.dataset.created)-Number(a.dataset.created))*(dir==='new'?1:-1));
+   rows.forEach(row=>bucket.appendChild(row));
+   group.appendChild(bucket);
+  });
+ });
+ const neu=document.getElementById('assistant-sort-new');
+ const old=document.getElementById('assistant-sort-old');
+ if(neu)neu.setAttribute('aria-pressed', dir==='new'?'true':'false');
+ if(old)old.setAttribute('aria-pressed', dir==='old'?'true':'false');
+}
+const sortNew=document.getElementById('assistant-sort-new');
+if(sortNew)sortNew.addEventListener('click',()=>sortAssistantJobs('new'));
+const sortOld=document.getElementById('assistant-sort-old');
+if(sortOld)sortOld.addEventListener('click',()=>sortAssistantJobs('old'));
+function appendMsg(role,text){
+ const log=document.getElementById('chat-log');
+ if(!log)return;
+ const empty=log.querySelector(':scope > .muted');
+ if(empty)empty.remove();
+ const wrap=document.createElement('div');
+ wrap.className='msg';
+ wrap.innerHTML='<div class="role"></div><div class="bubble"></div>';
+ wrap.querySelector('.role').textContent=role==='user'?'你':'助手';
+ wrap.querySelector('.bubble').textContent=text;
+ log.appendChild(wrap);
+ log.scrollTop=log.scrollHeight;
+}
+const chatForm=document.getElementById('assistant-form');
+if(chatForm){
+ chatForm.addEventListener('submit',async e=>{
+  e.preventDefault();
+  const input=document.getElementById('assistant-input');
+  const status=document.getElementById('assistant-status');
+  const send=document.getElementById('assistant-send');
+  const message=(input.value||'').trim();
+  if(!message)return;
+  appendMsg('user',message);
+  input.value='';
+  send.disabled=true;
+  status.textContent='助手处理中；搜索网上岗位时可能需要一两分钟…';
+  try{
+   const r=await fetch('/assistant/chat',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({csrf,message})});
+   const data=await r.json();
+   if(data.ok){appendMsg('assistant',data.reply);status.textContent='';}
+   else{status.textContent=data.error||'发送失败';}
+  }catch(err){status.textContent='网络错误，请重试';}
+  send.disabled=false;
+ });
+}
+const clearBtn=document.getElementById('assistant-clear');
+if(clearBtn)clearBtn.addEventListener('click',async()=>{
+ await fetch('/assistant/clear',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({csrf})});
+ const log=document.getElementById('chat-log');
+ if(log)log.innerHTML='<p class="muted">对话已清空。</p>';
+});
+document.querySelectorAll('button.hint').forEach(btn=>btn.addEventListener('click',()=>{
+ const input=document.getElementById('assistant-input');
+ if(input){input.value=btn.dataset.hint;input.focus()}
+}));
 </script></body></html>

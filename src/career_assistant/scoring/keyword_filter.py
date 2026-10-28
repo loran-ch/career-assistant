@@ -110,6 +110,10 @@ class KeywordFilter:
                 type_dropped += 1
                 logger.debug(f"岗位类型安全网剔除「{kind}」：{job.title}（{job.url}）")
                 continue
+            if job.source == "local":
+                job.keyword_matched = self._match(haystack) or job.keyword_matched or "local"
+                kept.append(job)
+                continue
             matched = self._match(haystack)
             if matched:
                 job.keyword_matched = matched
