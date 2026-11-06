@@ -11,6 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description="Career Assistant 本机求职助手")
     sub = parser.add_subparsers(dest="command", required=True)
     web = sub.add_parser("web", help="Flask 页面与单个后台 Worker")
+    web.add_argument("--host", default="127.0.0.1", help="监听地址；Docker 中使用 0.0.0.0")
     web.add_argument("--port", type=int, default=5000)
     web.add_argument("--schedule", action="store_true", help="按 Radar 配置定时创建搜索任务")
     sub.add_parser("migrate", help="备份并迁移同一个 Radar SQLite")
@@ -36,7 +37,12 @@ def main():
         return run_doctor(llm_test=False)
     from career_assistant.config import DB_PATH
     from career_assistant.store import Store
-    store = Store(os.environ.get("RADAR_DB_PATH", str(DB_PATH)))
+    from career_assistant.task_bus import configured_task_backend
+    task_backend = configured_task_backend()
+    store = Store(
+        os.environ.get("RADAR_DB_PATH", str(DB_PATH)),
+        task_backend=task_backend,
+    )
     backup = store.migrate()
     if args.command == "migrate":
         print(f"迁移完成；备份：{backup or '无需新迁移'}")
@@ -47,15 +53,33 @@ def main():
     from career_assistant.service import handlers, start_schedule
     app = create_app(store=store)
     if args.command == "web":
-        app.config["BASE_URL"] = f"http://127.0.0.1:{args.port}"
-    worker = Worker(store, handlers(store, app.config["UPLOAD_DIR"], app.config["BASE_URL"]))
+        app.config["BASE_URL"] = os.environ.get(
+            "CAREER_PUBLIC_BASE_URL",
+            f"http://127.0.0.1:{args.port}",
+        )
+    configured_handlers = handlers(
+        store,
+        app.config["UPLOAD_DIR"],
+        app.config["BASE_URL"],
+    )
+    worker = Worker(store, configured_handlers) if task_backend == "sqlite" else None
     scheduler = None
     try:
-        worker.start()
-        scheduler = start_schedule(store, monitoring=args.command == 'web' and args.schedule)
-        app.extensions['scheduler'] = scheduler
+        if args.command == "worker" and task_backend == "kafka":
+            from career_assistant.task_bus import KafkaTaskWorker
+            KafkaTaskWorker(store, configured_handlers).serve()
+            return 0
+        if worker:
+            worker.start()
         if args.command == "web":
-            app.run(host="127.0.0.1", port=args.port, debug=False, use_reloader=False)
+            scheduler = start_schedule(store, monitoring=args.schedule)
+            app.extensions['scheduler'] = scheduler
+            app.run(
+                host=args.host,
+                port=args.port,
+                debug=False,
+                use_reloader=False,
+            )
         else:
             import time
             while True:
@@ -65,7 +89,8 @@ def main():
     finally:
         if scheduler:
             scheduler.shutdown(wait=False)
-        worker.stop()
+        if worker:
+            worker.stop()
     return 0
 
 

@@ -6,24 +6,61 @@ from career_assistant.config import resume_path
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
 import secrets
 import sqlite3
+import tempfile
 from urllib.parse import urlsplit
 import uuid
 
-from flask import Flask, Response, abort, flash, redirect, render_template, request, send_file, session, stream_with_context, url_for, jsonify
+from flask import Flask, Response, abort, flash, g, redirect, render_template, request, send_file, session, stream_with_context, url_for, jsonify
+from werkzeug.security import check_password_hash, generate_password_hash
 from career_assistant.config import DATA_DIR, DB_PATH
 from career_assistant.db import Database
 from career_assistant.models import JobPosting, now_hk, parse_iso
 from career_assistant.scrapers.base import BaseScraper
-from .store import Store, APPLICATION_STATUSES, stamp, encode
+from .profile_context import (
+    AVATAR_CROP_MAX_ZOOM,
+    AVATAR_CROP_MIN_ZOOM,
+    EXPERIENCE_TYPES,
+    EXPERIENCE_TYPE_LABELS,
+    PROFILE_SECTION_LABELS,
+    PROFILE_SECTIONS,
+    SKILL_LEVELS,
+    merge_profile_facts,
+    normalize_profile_data,
+    profile_has_content,
+)
+from .report_audit import normalize_report_data
+from .resume_boundary import (
+    BoundaryAction,
+    BoundaryEvaluation,
+    boundary_check,
+    evaluate_boundaries,
+    evaluation_from_audit,
+    fact_objects_from_facts,
+    with_runtime_integrity,
+)
+from .resume_pdf import file_sha256
+from .store import (
+    APPLICATION_STATUSES,
+    Store,
+    canonical_output_text,
+    encode,
+    output_content_hash,
+    stamp,
+)
 from .service import require, material_markdown, queue_search
 
 LABELS = {"saved": "收藏", "preparing": "准备中", "applied": "已投递", "interview": "面试",
           "offer": "Offer", "rejected": "拒绝", "withdrawn": "撤回"}
+
+MAX_AVATAR_BYTES = 5 * 1024 * 1024
+AVATAR_MAX_EDGE = 1200
+AVATAR_MAX_PIXELS = 40_000_000
 
 
 DATE_BUCKETS = (
@@ -139,7 +176,215 @@ def tailored_download_name(snapshot: dict, item: dict) -> str:
     raw = f"{snapshot.get('company') or 'company'}-{snapshot.get('title') or 'resume'}-{item['id']}"
     safe = re.sub(r'[\\/:*?"<>|]+', "-", raw)
     safe = re.sub(r"\s+", "-", safe).strip("-.")[:80]
-    return f"{safe or 'resume'}.md"
+    return f"{safe or 'resume'}.pdf"
+
+
+def safe_next(target: str | None) -> str:
+    target = (target or "").strip()
+    parsed = urlsplit(target)
+    if (not target.startswith("/") or target.startswith("//") or "\\" in target
+            or parsed.scheme or parsed.netloc):
+        return ""
+    return target
+
+
+def parse_avatar_crop(values) -> dict:
+    """Validate the browser crop values and apply a safe centered default."""
+    result = {}
+    defaults = {"center_x": 0.5, "center_y": 0.5, "zoom": AVATAR_CROP_MIN_ZOOM}
+    ranges = {
+        "center_x": (0.0, 1.0, "头像水平位置"),
+        "center_y": (0.0, 1.0, "头像垂直位置"),
+        "zoom": (AVATAR_CROP_MIN_ZOOM, AVATAR_CROP_MAX_ZOOM, "头像缩放比例"),
+    }
+    form_keys = {"center_x": "crop_x", "center_y": "crop_y", "zoom": "crop_zoom"}
+    for key, default in defaults.items():
+        raw = values.get(form_keys[key])
+        if raw is None:
+            raw = values.get(key)
+        if raw is None or str(raw).strip() == "":
+            result[key] = default
+            continue
+        try:
+            value = float(str(raw).strip())
+        except ValueError:
+            raise ValueError("头像取景参数无效，请重新调整") from None
+        minimum, maximum, label = ranges[key]
+        if not math.isfinite(value) or not minimum <= value <= maximum:
+            raise ValueError(f"{label}超出允许范围，请重新调整")
+        result[key] = round(value, 6)
+    return result
+
+
+def _save_avatar_jpeg(image, avatar_dir: Path) -> dict:
+    """Content-address one metadata-safe JPEG and return its file information."""
+    sanitized = io.BytesIO()
+    image.save(sanitized, format="JPEG", quality=90, optimize=True)
+    payload = sanitized.getvalue()
+    digest = hashlib.sha256(payload).hexdigest()
+    avatar_dir.mkdir(parents=True, exist_ok=True)
+    destination = avatar_dir / f"{digest}.jpg"
+    if destination.exists():
+        if file_sha256(destination) != digest:
+            raise ValueError("头像文件哈希冲突，请重新上传")
+    else:
+        descriptor, temp_name = tempfile.mkstemp(prefix=".avatar-", suffix=".jpg", dir=avatar_dir)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            Path(temp_name).chmod(0o600)
+            os.replace(temp_name, destination)
+        finally:
+            Path(temp_name).unlink(missing_ok=True)
+    return {
+        "path": str(destination.resolve()),
+        "sha256": digest,
+        "mime_type": "image/jpeg",
+        "width": image.width,
+        "height": image.height,
+    }
+
+
+def _crop_portrait_avatar(image, crop: dict):
+    """Apply normalized center/zoom values to produce an exact 3:4 crop."""
+    from PIL import Image
+
+    width, height = image.size
+    zoom = crop["zoom"]
+    crop_width = max(1, round(min(width, height * 3 / 4) / zoom))
+    crop_height = max(1, round(crop_width * 4 / 3))
+    if crop_height > height:
+        crop_height = height
+        crop_width = max(1, round(crop_height * 3 / 4))
+    left = round(crop["center_x"] * width - crop_width / 2)
+    top = round(crop["center_y"] * height - crop_height / 2)
+    left = min(max(0, left), width - crop_width)
+    top = min(max(0, top), height - crop_height)
+    portrait = image.crop((left, top, left + crop_width, top + crop_height))
+    if portrait.size != (crop_width, crop_height):
+        portrait = portrait.resize(
+            (crop_width, crop_height),
+            Image.Resampling.LANCZOS,
+        )
+    return portrait
+
+
+def save_profile_avatar(upload, avatar_dir: Path, crop_values=None) -> dict:
+    """Decode, normalize and content-address a cropped, metadata-safe avatar."""
+    try:
+        from PIL import Image, ImageOps, UnidentifiedImageError
+    except ImportError as exc:
+        raise RuntimeError("头像处理组件未安装，请先安装 Pillow") from exc
+
+    crop = parse_avatar_crop(crop_values or {})
+    data = upload.read(MAX_AVATAR_BYTES + 1)
+    if len(data) > MAX_AVATAR_BYTES:
+        raise ValueError("头像不得超过 5 MB")
+    if not data:
+        raise ValueError("头像文件为空")
+
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            image_format = str(source.format or "").upper()
+            if image_format not in {"JPEG", "PNG", "WEBP"}:
+                raise ValueError("头像只支持 JPG、PNG 或 WebP")
+            if source.width * source.height > AVATAR_MAX_PIXELS:
+                raise ValueError("头像分辨率过大，请上传较小的图片")
+            image = ImageOps.exif_transpose(source)
+            if image.mode in {"RGBA", "LA"}:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+            image.thumbnail((AVATAR_MAX_EDGE, AVATAR_MAX_EDGE), Image.Resampling.LANCZOS)
+            source = _save_avatar_jpeg(image, avatar_dir)
+            cropped = _save_avatar_jpeg(_crop_portrait_avatar(image, crop), avatar_dir)
+    except ValueError:
+        raise
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError):
+        raise ValueError("无法识别该图片，请上传有效的 JPG、PNG 或 WebP") from None
+
+    return {
+        **cropped,
+        "source_path": source["path"],
+        "source_sha256": source["sha256"],
+        "source_width": source["width"],
+        "source_height": source["height"],
+        "crop": crop,
+        "original_filename": Path((upload.filename or "").replace("\\", "/")).name[:255],
+        "uploaded_at": stamp(),
+    }
+
+
+def adjust_profile_avatar(avatar: dict, crop_values, avatar_dir: Path) -> dict:
+    """Crop the original managed image again without uploading a replacement."""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("头像处理组件未安装，请先安装 Pillow") from exc
+
+    current = normalize_profile_data({"avatar": avatar})["avatar"]
+    if current is None:
+        raise ValueError("当前资料库没有可调整的头像")
+    crop = parse_avatar_crop(crop_values)
+    source_path = safe_avatar_source_path(current, avatar_dir)
+    try:
+        with Image.open(source_path) as source:
+            image = source.convert("RGB")
+    except OSError:
+        raise ValueError("头像原图无法读取，请重新上传") from None
+    cropped = _save_avatar_jpeg(_crop_portrait_avatar(image, crop), avatar_dir)
+    return {
+        **current,
+        **cropped,
+        "source_width": image.width,
+        "source_height": image.height,
+        "crop": crop,
+    }
+
+
+def _safe_managed_avatar_path(path_value: object, digest_value: object, avatar_dir: Path) -> Path:
+    """Resolve a managed avatar file and verify that its content was not changed."""
+    root = avatar_dir.resolve()
+    path = Path(str(path_value or "")).expanduser().resolve()
+    if path.parent != root or not path.is_file():
+        raise ValueError("头像文件不存在，请重新上传")
+    if file_sha256(path) != str(digest_value or ""):
+        raise ValueError("头像文件完整性检查未通过，请重新上传")
+    return path
+
+
+def safe_avatar_path(avatar: dict, avatar_dir: Path) -> Path:
+    """Resolve the current cropped avatar from managed storage."""
+    return _safe_managed_avatar_path(avatar.get("path"), avatar.get("sha256"), avatar_dir)
+
+
+def safe_avatar_source_path(avatar: dict, avatar_dir: Path) -> Path:
+    """Resolve the uncropped source image used by the avatar crop editor."""
+    return _safe_managed_avatar_path(
+        avatar.get("source_path") or avatar.get("path"),
+        avatar.get("source_sha256") or avatar.get("sha256"),
+        avatar_dir,
+    )
+
+
+def validated_username(value: str) -> str:
+    username = (value or "").strip()
+    if not 3 <= len(username) <= 32:
+        raise ValueError("用户名需为 3 至 32 个字符")
+    if not re.fullmatch(r"[\w.@+\-\u3400-\u4dbf\u4e00-\u9fff]+", username):
+        raise ValueError("用户名只能包含文字、字母、数字及 . _ @ + -")
+    return username
+
+
+def validated_password(value: str) -> str:
+    if not 8 <= len(value) <= 128:
+        raise ValueError("密码需为 8 至 128 个字符")
+    return value
 
 
 def create_app(store=None, data_dir=None, testing=False):
@@ -147,6 +392,8 @@ def create_app(store=None, data_dir=None, testing=False):
     data_dir = Path(data_dir or os.environ.get("RADAR_DATA_DIR", str(DATA_DIR)))
     uploads = data_dir / "course_uploads"
     uploads.mkdir(parents=True, exist_ok=True)
+    avatars = data_dir / "course_avatars"
+    avatars.mkdir(parents=True, exist_ok=True)
     secret_path = data_dir / "course.secret"
     try:
         fd = os.open(secret_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -157,15 +404,23 @@ def create_app(store=None, data_dir=None, testing=False):
             stream.write(secrets.token_hex(32))
     app.config.update(SECRET_KEY=secret_path.read_text().strip(), MAX_CONTENT_LENGTH=11 * 1024 * 1024,
                       SESSION_COOKIE_SAMESITE="Strict", SESSION_COOKIE_HTTPONLY=True,
+                      SESSION_COOKIE_NAME="career_assistant_session",
                       TESTING=testing, UPLOAD_DIR=uploads, BASE_URL="http://127.0.0.1:5000")
+    app.config["AVATAR_DIR"] = avatars
     store = store or Store(os.environ.get("RADAR_DB_PATH", str(DB_PATH)))
     store.migrate()
     app.extensions["store"] = store
+
+    @app.get("/healthz")
+    def healthz():
+        return jsonify({"ok": True, "task_backend": store.task_backend})
 
     @app.before_request
     def protect_local():
         if request.host.split(":")[0] not in {"localhost", "127.0.0.1"}:
             abort(403)
+        if request.endpoint == "healthz":
+            return None
         if "csrf" not in session:
             session["csrf"] = secrets.token_hex(32)
         if request.method == "POST":
@@ -174,18 +429,443 @@ def create_app(store=None, data_dir=None, testing=False):
                 supplied = supplied or str((request.get_json(silent=True) or {}).get("csrf") or "")
             if not secrets.compare_digest(str(supplied), session["csrf"]):
                 abort(403)
+        if request.endpoint == "static":
+            return None
+        user_id = session.get("user_id")
+        g.user = store.get_user(user_id) if user_id else None
+        if g.user is None and user_id:
+            session.pop("user_id", None)
+        if request.endpoint in {"login", "register"}:
+            return None
+        if g.user is None:
+            if request.path.startswith("/assistant") and request.is_json:
+                return jsonify({"ok": False, "error": "登录状态已失效，请重新登录"}), 401
+            target = safe_next(request.full_path.rstrip("?"))
+            if store.user_count() == 0:
+                return redirect(url_for("register", next=target))
+            return redirect(url_for("login", next=target))
+        return None
 
     @app.after_request
     def security_headers(response):
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Frame-Options"] = (
+            "SAMEORIGIN"
+            if request.endpoint == "tailored_resume_pdf"
+            else "DENY"
+        )
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "same-origin"
         return response
 
     @app.context_processor
     def context():
-        return {"csrf": session.get("csrf", ""), "labels": LABELS, "operation": secrets.token_hex(16)}
+        return {
+            "csrf": session.get("csrf", ""),
+            "labels": LABELS,
+            "operation": secrets.token_hex(16),
+            "current_user": getattr(g, "user", None),
+        }
+
+    def sign_in(user: dict) -> None:
+        session.clear()
+        session["user_id"] = user["id"]
+        session["csrf"] = secrets.token_hex(32)
+        g.user = user
+
+    def _source_version(label: str, value: int | None) -> dict:
+        return {"label": label, "value": value, "missing": value is None}
+
+    def _material_output(material: dict) -> dict:
+        data = material.get("data") or {}
+        review = data.get("review") or {}
+        issues = [str(item) for item in review.get("issues") or [] if str(item).strip()]
+        status = data.get("status")
+        if status == "problem_draft":
+            audit_status, audit_label = "issue", "存在待处理问题"
+        elif status == "reviewed":
+            audit_status, audit_label = "pass", "AI 审阅通过"
+        else:
+            audit_status, audit_label = "unreviewed", "未经独立 AI 审阅"
+        match = store.get("matches", material["match_id"]) or {}
+        content = canonical_output_text(material_markdown(data))
+        if audit_status == "pass":
+            checks = [boundary_check("audit_passed")]
+        elif audit_status == "issue":
+            checks = [boundary_check("audit_review_required")]
+        else:
+            checks = [boundary_check("material_unreviewed")]
+        boundary = evaluate_boundaries(
+            checks,
+            subject={"artifact_id": material["id"]},
+        )
+        approve_decision = boundary.decide(
+            BoundaryAction.APPROVE,
+            confirmed=True,
+        )
+        export_decision = boundary.decide(
+            BoundaryAction.EXPORT,
+            approved=True,
+        )
+        return {
+            "artifact_type": "material",
+            "artifact_id": material["id"],
+            "artifact_version": material["version"],
+            "approval_scope": "export",
+            "kind_label": "求职材料",
+            "artifact_kind": "material_markdown",
+            "title": f"求职材料 · 版本 {material['version']}",
+            "content": content,
+            "content_hash": output_content_hash(content),
+            "audit_status": audit_status,
+            "audit_label": audit_label,
+            "audit_summary": review.get("summary") or "",
+            "audit_findings": [],
+            "audit_issues": issues,
+            "boundary": boundary.to_dict(),
+            "refusal_level": boundary.level.value,
+            "refusal_label": boundary.level.label,
+            "boundary_checks": [
+                check.to_dict()
+                for check in boundary.checks
+            ],
+            "can_approve": approve_decision.allowed,
+            "can_export": export_decision.allowed,
+            "legacy": False,
+            "integrity_error": "",
+            "pdf_url": "",
+            "pdf_sha256": "",
+            "document_sha256": "",
+            "current_pdf_sha256": "",
+            "page_count": None,
+            "template_version": "",
+            "renderer_version": "",
+            "source_versions": [
+                _source_version("岗位 JD 依据", match.get("snapshot_id")),
+                _source_version("简历事实版本", match.get("resume_version_id")),
+                _source_version("职业资料版本", match.get("profile_version_id")),
+                _source_version("求职偏好版本", match.get("preference_id")),
+            ],
+            "return_url": url_for("material", material_id=material["id"]),
+            "approve_url": url_for("approve_material", material_id=material["id"]),
+            "download_url": url_for("export_material", material_id=material["id"]),
+        }
+
+    def _tailored_output(snapshot: dict, item: dict) -> dict:
+        source_snapshot = store.get("job_snapshots", item["snapshot_id"]) or snapshot
+        artifact_status = item.get("artifact_status") or "legacy"
+        is_pdf = artifact_status in {"audit_pass", "audit_issue"}
+        audit = item.get("audit") or {}
+        raw_boundary = item.get("boundary")
+        if raw_boundary:
+            try:
+                boundary = BoundaryEvaluation.from_dict(raw_boundary)
+            except ValueError:
+                boundary = evaluate_boundaries(
+                    [boundary_check("boundary_record_invalid")],
+                    subject={"artifact_id": item["id"]},
+                )
+        else:
+            resume_version = (
+                store.get("resume_versions", item.get("resume_version_id"))
+                if item.get("resume_version_id")
+                else None
+            )
+            profile_version = (
+                store.get("profile_versions", item.get("profile_version_id"))
+                if item.get("profile_version_id")
+                else None
+            )
+            historical_facts = merge_profile_facts(
+                (resume_version or {}).get("facts") or {},
+                normalize_profile_data((profile_version or {}).get("data") or {}),
+            )
+            boundary = evaluation_from_audit(
+                audit,
+                legacy=not is_pdf,
+                fact_objects=fact_objects_from_facts(historical_facts),
+                evidence_refs=(
+                    fact_id
+                    for finding in audit.get("findings") or []
+                    if isinstance(finding, dict)
+                    for fact_id in finding.get("fact_ids") or []
+                ),
+            )
+        findings = [
+            dict(row)
+            for row in (audit.get("findings") or [])
+            if isinstance(row, dict) and row.get("status") in {"pass", "issue"}
+        ]
+        issues = [
+            f"{row.get('title', '审计项')}：{row.get('detail', '')}".strip()
+            for row in findings
+            if row.get("status") == "issue"
+        ]
+        current_pdf_sha = ""
+        integrity_error = ""
+        pdf_path = ""
+        if is_pdf:
+            audit_status = artifact_status.removeprefix("audit_")
+            audit_label = "独立审计通过" if audit_status == "pass" else "独立审计发现问题"
+            content = ""
+            content_hash = str(item.get("pdf_sha256") or "")
+            try:
+                candidate = Path(str(item.get("pdf_path") or "")).expanduser().resolve()
+                pdf_root = (Path(store.path).parent / "course_resume_pdfs").resolve()
+                if not candidate.is_relative_to(pdf_root):
+                    integrity_error = "PDF 文件路径不在受控产物目录内"
+                elif not candidate.is_file():
+                    integrity_error = "PDF 文件缺失，无法审批或下载"
+                else:
+                    pdf_path = str(candidate)
+                    current_pdf_sha = file_sha256(candidate)
+                    if not secrets.compare_digest(current_pdf_sha, content_hash):
+                        integrity_error = "PDF 文件指纹与生成记录不一致，文件可能已被修改"
+            except (OSError, ValueError):
+                integrity_error = "PDF 文件无法读取，已阻止审批和下载"
+            boundary = with_runtime_integrity(boundary, integrity_error)
+        else:
+            audit_status = "unreviewed"
+            audit_label = "历史 Markdown，无独立审计报告"
+            content = canonical_output_text(item.get("body") or "")
+            content_hash = output_content_hash(content)
+        approve_decision = boundary.decide(
+            BoundaryAction.APPROVE,
+            confirmed=True,
+            hash_matches=not integrity_error,
+        )
+        export_decision = boundary.decide(
+            BoundaryAction.EXPORT,
+            approved=True,
+            hash_matches=not integrity_error,
+        )
+        return {
+            "artifact_type": "tailored_resume",
+            "artifact_id": item["id"],
+            "artifact_version": item["id"],
+            "approval_scope": "download",
+            "kind_label": "针对性简历",
+            "title": item["title"],
+            "content": content,
+            "content_hash": content_hash,
+            "audit_status": audit_status,
+            "audit_label": audit_label,
+            "audit_summary": audit.get("summary") or "",
+            "audit_findings": findings,
+            "audit_issues": issues,
+            "boundary": boundary.to_dict(),
+            "refusal_level": boundary.level.value,
+            "refusal_label": boundary.level.label,
+            "boundary_checks": [
+                check.to_dict()
+                for check in boundary.checks
+            ],
+            "can_approve": approve_decision.allowed,
+            "can_export": export_decision.allowed,
+            "artifact_kind": "pdf" if is_pdf else "legacy_markdown",
+            "legacy": not is_pdf,
+            "pdf_path": pdf_path,
+            "pdf_url": (
+                url_for(
+                    "tailored_resume_pdf",
+                    snapshot_id=snapshot["id"],
+                    record_id=item["id"],
+                )
+                if is_pdf
+                else ""
+            ),
+            "pdf_sha256": str(item.get("pdf_sha256") or ""),
+            "document_sha256": str(item.get("content_sha256") or ""),
+            "current_pdf_sha256": current_pdf_sha,
+            "integrity_error": integrity_error,
+            "page_count": item.get("page_count"),
+            "template_version": item.get("template_version") or "",
+            "renderer_version": item.get("renderer_version") or "",
+            "source_versions": [
+                _source_version("岗位 JD 依据", source_snapshot.get("id")),
+                _source_version("上传简历", item.get("resume_id")),
+                _source_version("简历事实版本", item.get("resume_version_id")),
+                _source_version("职业资料版本", item.get("profile_version_id")),
+                _source_version("投递信息版本", item.get("delivery_profile_id")),
+            ],
+            "return_url": url_for(
+                "tailored_resume",
+                snapshot_id=snapshot["id"],
+                record_id=item["id"],
+            ),
+            "approve_url": url_for(
+                "approve_tailored_resume",
+                snapshot_id=snapshot["id"],
+                record_id=item["id"],
+            ),
+            "download_url": url_for(
+                "download_tailored_resume",
+                snapshot_id=snapshot["id"],
+                record_id=item["id"],
+            ),
+        }
+
+    def _existing_output_approval(output: dict) -> dict | None:
+        approval = store.find_output_approval(
+            output["artifact_type"],
+            output["artifact_id"],
+            output["content_hash"],
+            output["approval_scope"],
+        )
+        if (
+            approval
+            and output.get("artifact_kind") == "pdf"
+            and (
+                output.get("integrity_error")
+                or not secrets.compare_digest(
+                    output.get("current_pdf_sha256") or "",
+                    output["content_hash"],
+                )
+            )
+        ):
+            return None
+        return approval
+
+    def _output_audit_snapshot(output: dict) -> dict:
+        return {
+            "title": output["title"],
+            "kind_label": output["kind_label"],
+            "artifact_version": output["artifact_version"],
+            "audit_status": output["audit_status"],
+            "audit_label": output["audit_label"],
+            "audit_summary": output.get("audit_summary") or "",
+            "audit_issues": output["audit_issues"],
+            "audit_findings": output.get("audit_findings") or [],
+            "boundary": output.get("boundary") or {},
+            "refusal_level": output.get("refusal_level") or "",
+            "pdf_sha256": output.get("pdf_sha256") or "",
+            "document_sha256": output.get("document_sha256") or "",
+            "page_count": output.get("page_count"),
+            "template_version": output.get("template_version") or "",
+            "renderer_version": output.get("renderer_version") or "",
+            "source_versions": {
+                row["label"]: row["value"] for row in output["source_versions"]
+            },
+        }
+
+    def _approve_output(output: dict):
+        submitted_hash = str(request.form.get("content_hash") or "").strip()
+        confirmed = request.form.get("confirm_review") == "yes"
+        hash_matches = secrets.compare_digest(
+            submitted_hash,
+            output["content_hash"],
+        )
+        if output.get("boundary"):
+            decision = BoundaryEvaluation.from_dict(
+                output["boundary"]
+            ).decide(
+                BoundaryAction.APPROVE,
+                confirmed=confirmed,
+                hash_matches=hash_matches,
+            )
+            if not decision.allowed:
+                raise ValueError(
+                    f"审批被拒绝（{decision.level.value.upper()} · "
+                    f"{decision.code}）：{decision.summary}"
+                )
+        if not hash_matches:
+            raise ValueError("输出内容已变化，请刷新审批页后重新核对")
+        if output.get("artifact_kind") == "pdf":
+            if output.get("integrity_error"):
+                raise ValueError(output["integrity_error"])
+            if not secrets.compare_digest(
+                output.get("current_pdf_sha256") or "",
+                submitted_hash,
+            ):
+                raise ValueError("PDF 文件已变化，请刷新审批页后重新核对")
+        if not confirmed:
+            raise ValueError("请先确认已核对当前版本及其来源")
+        store.record_output_approval(
+            output["artifact_type"],
+            output["artifact_id"],
+            output["artifact_version"],
+            output["content_hash"],
+            _output_audit_snapshot(output),
+            g.user["id"],
+            output["approval_scope"],
+        )
+        if output.get("artifact_kind") == "pdf":
+            try:
+                after_hash = file_sha256(output["pdf_path"])
+            except OSError:
+                raise ValueError("PDF 文件在审批过程中不可读取，请重新核对") from None
+            if not secrets.compare_digest(after_hash, submitted_hash):
+                raise ValueError("PDF 文件在审批过程中发生变化，请重新审批")
+        elif output_content_hash(output["content"]) != submitted_hash:
+            raise ValueError("输出内容在审批过程中发生变化，请重新审批")
+        return redirect(output["download_url"])
+
+    @app.route("/register", methods=["GET", "POST"])
+    def register():
+        next_url = safe_next(request.values.get("next"))
+        if store.user_count():
+            flash("本机账户已经创建，请直接登录。")
+            return redirect(url_for("login", next=next_url) if next_url else url_for("login"))
+
+        error = ""
+        username = (request.form.get("username") or "").strip()
+        if request.method == "POST":
+            try:
+                username = validated_username(username)
+                password = validated_password(request.form.get("password") or "")
+                confirmation = request.form.get("password_confirm") or ""
+                if password != confirmation:
+                    raise ValueError("两次输入的密码不一致")
+                user_id = store.create_initial_user(username, generate_password_hash(password))
+            except ValueError as exc:
+                error = str(exc)
+            except sqlite3.IntegrityError:
+                error = "该用户名不可用，请更换后重试"
+            else:
+                user = store.get_user(user_id)
+                if user is None:
+                    raise RuntimeError("账户创建后无法读取")
+                store.mark_user_login(user_id)
+                sign_in(user)
+                flash("账户已创建，欢迎使用。")
+                return redirect(next_url or url_for("jobs"))
+
+        return render_template(
+            "auth.html", mode="register", error=error, username=username,
+            next_url=next_url,
+        )
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        next_url = safe_next(request.values.get("next"))
+        if store.user_count() == 0:
+            return redirect(url_for("register", next=next_url) if next_url else url_for("register"))
+        if getattr(g, "user", None):
+            return redirect(next_url or url_for("jobs"))
+
+        error = ""
+        username = (request.form.get("username") or "").strip()
+        if request.method == "POST":
+            user = store.get_user_by_username(username)
+            password = request.form.get("password") or ""
+            if user and check_password_hash(user["password_hash"], password):
+                store.mark_user_login(user["id"])
+                user.pop("password_hash", None)
+                sign_in(user)
+                return redirect(next_url or url_for("jobs"))
+            error = "用户名或密码不正确"
+
+        return render_template(
+            "auth.html", mode="login", error=error, username=username,
+            next_url=next_url,
+        )
+
+    @app.post("/logout")
+    def logout():
+        session.clear()
+        session["csrf"] = secrets.token_hex(32)
+        flash("已退出登录。")
+        return redirect(url_for("login"))
 
     @app.errorhandler(ValueError)
     def invalid(exc):
@@ -204,6 +884,9 @@ def create_app(store=None, data_dir=None, testing=False):
 
     @app.errorhandler(413)
     def too_large(exc):
+        if request.path == "/profile/avatar":
+            session["form_error"] = "头像不得超过 5 MB。请替换文件。"
+            return redirect(url_for("profile", _anchor="profile-avatar"))
         return invalid(ValueError("简历不得超过 10 MB。请替换文件。")) if request.form.get("return_to") else (render_template("page.html", page="error", error="简历不得超过 10 MB。"), 413)
 
     def task_redirect(task_id):
@@ -221,7 +904,7 @@ def create_app(store=None, data_dir=None, testing=False):
                     store.update_preparation(record["id"], resume_id=item["payload"]["resume_id"])
                     store.resume_waiting(item["payload"]["resume_id"])
                 return redirect(url_for("job_detail", snapshot_id=record["snapshot_id"], task=task_id))
-            return redirect(url_for("profile", task=task_id))
+            return redirect(url_for("profile", task=task_id, _anchor="profile-resumes"))
         if item["kind"] == "email":
             if item["payload"]["type"] == "report":
                 report = require(store, "reports", item["payload"]["id"])
@@ -245,16 +928,139 @@ def create_app(store=None, data_dir=None, testing=False):
             fav = "pending"
         pool = pending if fav == "pending" else reports
         listed, fav_page, fav_pages, fav_total = paginate_items(pool, "p")
+        profile_version = store.latest_profile_version()
+        profile_data = normalize_profile_data(profile_version["data"] if profile_version else {})
+        task_arg = request.args.get("task") or ""
+        upload_task = store.get("tasks", int(task_arg)) if task_arg.isdigit() else None
+        if upload_task and upload_task["kind"] != "analyze":
+            upload_task = None
+        upload_facts = (
+            store.list("resume_versions", resume_id=upload_task["payload"]["resume_id"])
+            if upload_task else []
+        )
         return render_template(
             "page.html", page="home",
             preparations=store.list("preparations"), resumes=store.list("resumes"),
             versions=store.list("resume_versions"), preferences=store.list("preferences"),
             tasks=store.list("tasks")[:20], applications=store.list("applications"),
             matches=store.list("matches"),
+            profile_version=profile_version, profile_data=profile_data,
+            profile_history=[
+                {**item, "data": normalize_profile_data(item.get("data"))}
+                for item in store.list("profile_versions")[:12]
+            ],
+            profile_sections=PROFILE_SECTIONS,
+            profile_section_labels=PROFILE_SECTION_LABELS,
+            delivery_profile=store.latest_delivery_profile(),
+            selected_resume=session.get("resume_id"),
+            skill_levels=SKILL_LEVELS, experience_types=EXPERIENCE_TYPES,
+            experience_type_labels=EXPERIENCE_TYPE_LABELS,
+            upload_task=upload_task, upload_facts_available=bool(upload_facts),
             favorites=favorites, listed_favorites=listed,
             pending_favorites=pending, report_favorites=reports,
             fav_filter=fav, fav_page=fav_page, fav_pages=fav_pages, fav_total=fav_total,
         )
+
+    @app.post("/profile/delivery")
+    def save_delivery_profile():
+        values = {
+            "name": request.form.get("name") or "",
+            "email": request.form.get("email") or "",
+            "phone": request.form.get("phone") or "",
+            "location": request.form.get("location") or "",
+            "links": [
+                value.strip()
+                for value in request.form.getlist("links")
+                if value.strip()
+            ],
+        }
+        version_id = store.confirm_delivery_profile(values)
+        flash(f"投递信息已确认并保存为版本 #{version_id}")
+        return redirect(url_for("profile", _anchor="profile-delivery"))
+
+    @app.post("/profile/avatar")
+    def upload_profile_avatar():
+        file = request.files.get("avatar")
+        if not file or not file.filename:
+            raise ValueError("请选择头像图片")
+        metadata = save_profile_avatar(file, app.config["AVATAR_DIR"], request.form)
+        try:
+            version_id = store.set_profile_avatar(metadata)
+        except Exception:
+            # Content-addressed files can remain for another snapshot without exposing them.
+            raise
+        flash(f"头像已保存为职业资料版本 #{version_id}")
+        return redirect(url_for("profile", _anchor="profile-avatar"))
+
+    @app.post("/profile/avatar/adjust")
+    def adjust_profile_avatar_route():
+        profile_version = store.latest_profile_version()
+        profile = normalize_profile_data(profile_version["data"] if profile_version else {})
+        avatar = profile["avatar"]
+        if avatar is None:
+            raise ValueError("当前资料库没有可调整的头像")
+        metadata = adjust_profile_avatar(avatar, request.form, app.config["AVATAR_DIR"])
+        version_id = store.set_profile_avatar(metadata)
+        flash(f"头像取景已保存为职业资料版本 #{version_id}")
+        return redirect(url_for("profile", _anchor="profile-avatar"))
+
+    @app.post("/profile/avatar/delete")
+    def delete_profile_avatar():
+        version_id = store.delete_profile_avatar()
+        flash(f"头像已移除并保存为职业资料版本 #{version_id}")
+        return redirect(url_for("profile", _anchor="profile-avatar"))
+
+    @app.get("/profile/avatar/image")
+    def profile_avatar_image():
+        profile_version = store.latest_profile_version()
+        profile = normalize_profile_data(profile_version["data"] if profile_version else {})
+        avatar = profile["avatar"]
+        if avatar is None:
+            abort(404)
+        path = safe_avatar_path(avatar, app.config["AVATAR_DIR"])
+        response = send_file(path, mimetype="image/jpeg", as_attachment=False)
+        response.cache_control.no_store = True
+        response.cache_control.private = True
+        return response
+
+    @app.get("/profile/avatar/source")
+    def profile_avatar_source():
+        profile_version = store.latest_profile_version()
+        profile = normalize_profile_data(profile_version["data"] if profile_version else {})
+        avatar = profile["avatar"]
+        if avatar is None:
+            abort(404)
+        path = safe_avatar_source_path(avatar, app.config["AVATAR_DIR"])
+        response = send_file(path, mimetype="image/jpeg", as_attachment=False)
+        response.cache_control.no_store = True
+        response.cache_control.private = True
+        return response
+
+    def profile_section(section: str) -> str:
+        if section not in PROFILE_SECTIONS:
+            raise ValueError("未知资料分类")
+        return section
+
+    @app.post("/profile/<section>/items")
+    def add_profile_item(section):
+        section = profile_section(section)
+        version_id = store.add_profile_item(section, request.form)
+        flash(f"{PROFILE_SECTION_LABELS[section]}已保存为资料版本 #{version_id}")
+        return redirect(url_for("profile", _anchor=f"profile-{section}"))
+
+    @app.post("/profile/<section>/items/<item_id>")
+    def update_profile_item(section, item_id):
+        section = profile_section(section)
+        version_id = store.update_profile_item(section, item_id, request.form)
+        flash(f"{PROFILE_SECTION_LABELS[section]}已更新为资料版本 #{version_id}")
+        return redirect(url_for("profile", _anchor=f"profile-{section}"))
+
+    @app.post("/profile/<section>/items/<item_id>/delete")
+    def delete_profile_item(section, item_id):
+        section = profile_section(section)
+        version_id = store.delete_profile_item(section, item_id)
+        flash(f"{PROFILE_SECTION_LABELS[section]}已删除并保存为资料版本 #{version_id}")
+        return redirect(url_for("profile", _anchor=f"profile-{section}"))
 
     @app.post("/resumes")
     def upload():
@@ -276,13 +1082,24 @@ def create_app(store=None, data_dir=None, testing=False):
             path.unlink(missing_ok=True)
             raise
         session["resume_id"] = resume_id
-        task_id = store.enqueue("analyze", {"resume_id": resume_id}, f"analyze:{resume_id}", max_attempts=2)
+        import_values = request.form.getlist("import_profile")
+        import_profile = "yes" in import_values if import_values else True
+        task_id = store.enqueue(
+            "analyze",
+            {"resume_id": resume_id, "import_profile": import_profile},
+            f"analyze:{resume_id}",
+            max_attempts=2,
+        )
         return task_redirect(task_id)
 
     @app.get("/resumes/<int:resume_id>")
     def resume(resume_id):
         item = require(store, "resumes", resume_id)
         reports = store.list("reports", resume_id=resume_id)
+        reports = [
+            {**report, "data": normalize_report_data(report["data"])}
+            for report in reports
+        ]
         versions = store.list("resume_versions", resume_id=resume_id)
         facts = versions[0]["facts"].get("facts", []) if versions else reports[0]["data"].get("facts", []) if reports else []
         return render_template("page.html", page="resume", resume=item, reports=reports, versions=versions,
@@ -448,12 +1265,56 @@ def create_app(store=None, data_dir=None, testing=False):
             if new_id is None:
                 new_id = store.save_material(item["match_id"], data, parent_id=material_id)
             return redirect(url_for("material", material_id=new_id))
-        return render_template("page.html", page="material", material=item, markdown=material_markdown(item["data"]))
+        output = _material_output(item)
+        return render_template(
+            "page.html",
+            page="material",
+            material=item,
+            markdown=material_markdown(item["data"]),
+            output_approved=_existing_output_approval(output) is not None,
+        )
+
+    @app.route("/materials/<int:material_id>/approve", methods=["GET", "POST"])
+    def approve_material(material_id):
+        item = require(store, "materials", material_id)
+        output = _material_output(item)
+        if request.method == "POST":
+            return _approve_output(output)
+        return render_template(
+            "approval.html",
+            page="approval",
+            output=output,
+            existing_approval=_existing_output_approval(output),
+        )
 
     @app.get("/materials/<int:material_id>/export")
     def export_material(material_id):
         item = require(store, "materials", material_id)
-        return send_file(io.BytesIO(material_markdown(item["data"]).encode()), mimetype="text/markdown; charset=utf-8",
+        output = _material_output(item)
+        approval = _existing_output_approval(output)
+        if approval is None:
+            return redirect(url_for("approve_material", material_id=material_id))
+        current_hash = output_content_hash(material_markdown(item["data"]))
+        if not secrets.compare_digest(current_hash, approval["content_hash"]):
+            return redirect(url_for("approve_material", material_id=material_id))
+        decision = BoundaryEvaluation.from_dict(
+            output["boundary"]
+        ).decide(
+            BoundaryAction.EXPORT,
+            approved=True,
+            hash_matches=secrets.compare_digest(
+                current_hash,
+                approval["content_hash"],
+            ),
+        )
+        if not decision.allowed:
+            flash(
+                f"导出被拒绝（{decision.level.value.upper()} · "
+                f"{decision.code}）：{decision.summary}"
+            )
+            return redirect(url_for("approve_material", material_id=material_id))
+        payload = canonical_output_text(material_markdown(item["data"])).encode("utf-8")
+        return send_file(io.BytesIO(payload), mimetype="text/markdown; charset=utf-8",
                          as_attachment=True, download_name=f'material-{material_id}-v{item["version"]}.md')
 
     @app.post("/materials/<int:material_id>/application")
@@ -556,13 +1417,20 @@ def create_app(store=None, data_dir=None, testing=False):
         session["assistant_jobs"] = selected
         return selected
 
+    def _assistant_resume_id():
+        if "assistant_resume_id" in session:
+            return session.get("assistant_resume_id")
+        return session.get("resume_id")
+
     @app.get("/assistant")
     def assistant():
-        resume_id = session.get("assistant_resume_id") or session.get("resume_id")
+        resume_id = _assistant_resume_id()
         favorites = [annotate_favorite(item) for item in store.list_favorites()]
         counts = store.tailored_resume_counts()
         pending = [item for item in favorites if not counts.get(item["job_uid"])]
         ready = [item for item in favorites if counts.get(item["job_uid"])]
+        profile_version = store.latest_profile_version()
+        profile_data = normalize_profile_data(profile_version["data"] if profile_version else {})
         return render_template(
             "workspace.html",
             page="assistant",
@@ -575,6 +1443,11 @@ def create_app(store=None, data_dir=None, testing=False):
             selected_jobs=_assistant_selected(),
             resumes=store.list("resumes"),
             selected_resume=resume_id,
+            profile_version=profile_version,
+            profile_counts={
+                section: len(profile_data[section]) for section in PROFILE_SECTIONS
+            },
+            profile_has_content=profile_has_content(profile_data),
             messages=session.get("assistant_chat") or [],
             ai_ready=all(os.environ.get(k) for k in ("RADAR_AI_API_KEY", "RADAR_AI_MODEL", "RADAR_AI_BASE_URL")),
         )
@@ -600,6 +1473,8 @@ def create_app(store=None, data_dir=None, testing=False):
             resume = require(store, "resumes", int(resume_id))
             session["assistant_resume_id"] = resume["id"]
             session["resume_id"] = resume["id"]
+        else:
+            session["assistant_resume_id"] = None
         return jsonify({"ok": True, "count": len(selected)})
 
     @app.post("/assistant/chat")
@@ -610,7 +1485,7 @@ def create_app(store=None, data_dir=None, testing=False):
         if not message:
             return jsonify({"ok": False, "error": "请输入问题或任务说明。"}), 400
         selected = _assistant_selected()
-        resume_id = session.get("assistant_resume_id") or session.get("resume_id")
+        resume_id = _assistant_resume_id()
         history = [
             {"role": item["role"], "content": item["content"]}
             for item in (session.get("assistant_chat") or [])[-12:]
@@ -714,6 +1589,9 @@ def create_app(store=None, data_dir=None, testing=False):
             tailored_resumes=store.list_tailored_resumes(snapshot["job_uid"]))
         if request.args.get("fragment"):
             return render_template("job_progress.html", **args)
+        for item in args["tailored_resumes"]:
+            output = _tailored_output(snapshot, item)
+            item["output_approved"] = _existing_output_approval(output) is not None
         return render_template("workspace.html", page="job", **args)
 
     @app.get("/jobs/<int:snapshot_id>/resumes/<int:record_id>")
@@ -722,7 +1600,66 @@ def create_app(store=None, data_dir=None, testing=False):
         item = store.get_tailored_resume(snapshot_id, record_id)
         if not item:
             abort(404)
-        return render_template("workspace.html", page="tailored_resume", snapshot=snapshot, item=item)
+        output = _tailored_output(snapshot, item)
+        return render_template(
+            "workspace.html",
+            page="tailored_resume",
+            snapshot=snapshot,
+            item=item,
+            output=output,
+            output_approved=_existing_output_approval(output) is not None,
+        )
+
+    @app.post("/jobs/<int:snapshot_id>/resumes/<int:record_id>/delete")
+    def delete_tailored_resume(snapshot_id, record_id):
+        snapshot = require(store, "job_snapshots", snapshot_id)
+        item = store.get_tailored_resume(snapshot_id, record_id)
+        if not item:
+            abort(404)
+        removed = store.delete_tailored_resume(
+            snapshot_id,
+            record_id,
+            g.user["id"],
+        )
+        if removed:
+            flash("针对性简历已删除；职业资料、审批记录和底层审计版本仍保留。")
+        else:
+            flash("针对性简历已从列表移除。")
+        return redirect(url_for("job_detail", snapshot_id=snapshot["id"]))
+
+    @app.route("/jobs/<int:snapshot_id>/resumes/<int:record_id>/approve", methods=["GET", "POST"])
+    def approve_tailored_resume(snapshot_id, record_id):
+        snapshot = require(store, "job_snapshots", snapshot_id)
+        item = store.get_tailored_resume(snapshot_id, record_id)
+        if not item:
+            abort(404)
+        output = _tailored_output(snapshot, item)
+        if request.method == "POST":
+            return _approve_output(output)
+        return render_template(
+            "approval.html",
+            page="approval",
+            output=output,
+            existing_approval=_existing_output_approval(output),
+        )
+
+    @app.get("/jobs/<int:snapshot_id>/resumes/<int:record_id>/pdf")
+    def tailored_resume_pdf(snapshot_id, record_id):
+        snapshot = require(store, "job_snapshots", snapshot_id)
+        item = store.get_tailored_resume(snapshot_id, record_id)
+        if not item or item.get("artifact_status") not in {"audit_pass", "audit_issue"}:
+            abort(404)
+        output = _tailored_output(snapshot, item)
+        if output.get("integrity_error"):
+            abort(409, description=output["integrity_error"])
+        response = send_file(
+            Path(output["pdf_path"]),
+            mimetype="application/pdf",
+            as_attachment=False,
+            download_name=tailored_download_name(snapshot, item),
+            conditional=True,
+        )
+        return response
 
     @app.get("/jobs/<int:snapshot_id>/resumes/<int:record_id>/download")
     def download_tailored_resume(snapshot_id, record_id):
@@ -730,12 +1667,76 @@ def create_app(store=None, data_dir=None, testing=False):
         item = store.get_tailored_resume(snapshot_id, record_id)
         if not item:
             abort(404)
-        payload = (item["body"] or "").encode("utf-8")
+        output = _tailored_output(snapshot, item)
+        approval = _existing_output_approval(output)
+        if approval is None:
+            return redirect(
+                url_for(
+                    "approve_tailored_resume",
+                    snapshot_id=snapshot_id,
+                    record_id=record_id,
+                )
+            )
+        if output.get("artifact_kind") == "pdf":
+            if output.get("integrity_error"):
+                flash(output["integrity_error"])
+                return redirect(
+                    url_for(
+                        "approve_tailored_resume",
+                        snapshot_id=snapshot_id,
+                        record_id=record_id,
+                    )
+                )
+            current_hash = output["current_pdf_sha256"]
+        else:
+            current_hash = output_content_hash(item.get("body") or "")
+        if not secrets.compare_digest(current_hash, approval["content_hash"]):
+            flash("文件指纹已变化，旧审批不能继续用于下载。")
+            return redirect(
+                url_for(
+                    "approve_tailored_resume",
+                    snapshot_id=snapshot_id,
+                    record_id=record_id,
+                )
+            )
+        if output.get("boundary"):
+            decision = BoundaryEvaluation.from_dict(
+                output["boundary"]
+            ).decide(
+                BoundaryAction.EXPORT,
+                approved=True,
+                hash_matches=secrets.compare_digest(
+                    current_hash,
+                    approval["content_hash"],
+                ),
+            )
+            if not decision.allowed:
+                flash(
+                    f"导出被拒绝（{decision.level.value.upper()} · "
+                    f"{decision.code}）：{decision.summary}"
+                )
+                return redirect(
+                    url_for(
+                        "approve_tailored_resume",
+                        snapshot_id=snapshot_id,
+                        record_id=record_id,
+                    )
+                )
+        if output.get("artifact_kind") == "pdf":
+            return send_file(
+                Path(output["pdf_path"]),
+                mimetype="application/pdf",
+                as_attachment=True,
+                download_name=tailored_download_name(snapshot, item),
+                conditional=True,
+            )
+        payload = canonical_output_text(item.get("body") or "").encode("utf-8")
         return send_file(
             io.BytesIO(payload),
             mimetype="text/markdown; charset=utf-8",
             as_attachment=True,
-            download_name=tailored_download_name(snapshot, item),
+            download_name=tailored_download_name(snapshot, item).removesuffix(".pdf")
+            + ".md",
         )
 
     @app.post("/tasks/<int:task_id>/inputs")

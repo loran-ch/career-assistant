@@ -27,7 +27,9 @@ career-assistant web --port 5000
 
 Windows PowerShell 设置目录使用 `$env:CAREER_HOME = (Get-Location).Path`。
 
-打开 [本机网页](http://127.0.0.1:5000)。源码检出也可使用 `python main.py migrate`、`python main.py web`；均调用同一个入口。`python -m career_assistant` 等价。`web --schedule` 启用按配置定时创建搜索任务；每日邮件由网页设置控制。`worker` 供单独运行后台使用，不要与 web 对同一个库同时启动。`login jobsdb`（或 indeed、linkedin）显式打开已有浏览器档案供用户手动登录，不自动绕过限制。`doctor` 是显式维护诊断，会检查外部网络但不调用 AI；不能将其作为离线测试。
+打开 [本机网页](http://127.0.0.1:5000)。源码检出也可使用 `python main.py migrate`、`python main.py web`；均调用同一个入口。`python -m career_assistant` 等价。`web --schedule` 启用按配置定时创建搜索任务；每日邮件由网页设置控制。默认 SQLite 模式下 web 内置单个 Worker，不能同时启动 `worker`；Kafka 模式下 web 不启动内嵌 Worker，需单独运行 `worker`。`login jobsdb`（或 indeed、linkedin）显式打开已有浏览器档案供用户手动登录，不自动绕过限制。`doctor` 是显式维护诊断，会检查外部网络但不调用 AI；不能将其作为离线测试。
+
+首次打开网页会要求创建一个唯一的本机账户，之后访问求职数据需要先登录。密码只以安全哈希保存在本地数据库，不保存明文；本机账户不提供公开注册、多人隔离或线上找回密码能力。
 
 ## 数据与恢复
 
@@ -45,3 +47,17 @@ Windows PowerShell 设置目录使用 `$env:CAREER_HOME = (Get-Location).Path`�
 - [上游来源与版权](docs/UPSTREAM.md) · [MIT 许可证](LICENSE)
 
 本仓库发布当前运行程序。测试、开发依赖及历史验收资料保留在本地，不是安装运行前提。AI 和招聘来源依赖实际服务配置及访问条件，不保证跨越登录、验证码或访问限制。
+
+“我的资料”可维护技能树、工作／实习／项目经历、证书和补充资料。每项新增、修改或删除都会保存为不可变的资料版本；岗位匹配、准备记录、AI 助手和针对性简历会使用当时固定的资料快照，后续编辑不会悄悄改写已有结果。AI 只使用简历原文、已保存事实和这些结构化资料，缺信息时标为未知或省略，不编造经历、技能、证书或成果。
+
+针对性简历内置 5 个项目技能：岗位简报、证据筛选、成果表达、ATS／版式质量和独立审计。生成前先拆解岗位并建立 `fact_ids` 证据映射，再按策略成稿；确定性校验通过后才渲染 PDF，最后由独立审计角色复核。
+
+## 可选 Kafka 与 Docker Compose
+
+本机默认运行不依赖 Kafka。课程演示需要展示消息队列时，可使用项目内的 Compose 配置启动 Kafka、Web 和单 Worker：
+
+```sh
+docker compose up --build
+```
+
+宿主机默认访问 `http://127.0.0.1:5000`；若端口被占用，设置 `CAREER_WEB_PORT=5050`。Kafka 只传递任务通知，任务状态、幂等键、重试和最终结果仍保存在 SQLite。完整架构、健康检查、topic 检查和故障恢复步骤见 [Kafka 与 Docker Compose 运行说明](docs/KAFKA_DOCKER.md)。

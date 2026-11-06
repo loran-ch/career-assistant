@@ -1,15 +1,81 @@
 <!doctype html><html lang="zh-Hans"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>INT6181 · 求职助手</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='workspace.css') }}"></head><body>
-<header><strong>INT6181 · 智能求职助手</strong><nav><a href="/jobs">岗位</a><a href="/assistant">AI助手</a><a href="/applications">申请</a><a href="/profile">我的资料</a><a href="/settings">设置</a></nav></header><main>{% for message in get_flashed_messages() %}<p class="notice">{{message}}</p>{% endfor %}{% if session.get("form_error") %}<p class="notice" role="alert">{{session.pop("form_error")}}</p>{% endif %}
-{% macro token(return_to=None) %}<input type="hidden" name="return_to" value="{{return_to if return_to is not none else request.path}}"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="operation" value="{{operation}}">{% endmacro %}
+<link rel="stylesheet" href="{{ url_for('static', filename='workspace.css') }}"><link rel="stylesheet" href="{{ url_for('static', filename='motion.css') }}"></head><body>
+{% include '_app_header.html' %}<main>{% for message in get_flashed_messages() %}<p class="notice">{{message}}</p>{% endfor %}{% if session.get("form_error") %}<p class="notice" role="alert">{{session.pop("form_error")}}</p>{% endif %}
+{% from '_form_macros.html' import token with context %}
 {% macro preference_select(items) %}<label>求职偏好<select name="preference_id">{% if not items %}<option value="">未设置</option>{% endif %}{% for p in items %}<option value="{{p.id}}">#{{p.id}} · {{p.data.keywords|join(' / ')}} · {{p.data.location}}</option>{% endfor %}</select></label>{% endmacro %}
 {% macro location_select(current='Hong Kong') %}{% set places=[('Hong Kong','香港'),('China','中国内地'),('United States','美国'),('United Kingdom','英国'),('Singapore','新加坡'),('Canada','加拿大'),('Australia','澳大利亚'),('Japan','日本'),('Taiwan','台湾'),('Macau','澳门'),('Remote','远程')] %}<label>地区<select name="location" required>{% for value,label in places %}<option value="{{value}}"{% if value==current %} selected{% endif %}>{{label}}</option>{% endfor %}{% if current and current not in places|map(attribute='0')|list %}<option value="{{current}}" selected>{{current}}（当前保存）</option>{% endif %}</select></label>{% endmacro %}
 {% macro resume_select(items, selected=none) %}<label>使用简历<select name="resume_id">{% for r in items %}<option value="{{r.id}}" {% if r.id==selected %}selected{% endif %}>{{r.filename}} · #{{r.id}}</option>{% endfor %}</select></label>{% endmacro %}
 {% macro review_history(items) %}{% for review in items %}<details open><summary>第 {{loop.index}} 轮 · {{'通过' if review.approved else '未通过'}}</summary><ul>{% for issue in review.issues %}<li>{{issue}}</li>{% endfor %}</ul></details>{% endfor %}{% endmacro %}
 {% set states={'queued':'等待处理','fetching_jd':'获取完整 JD','matching':'分析匹配','materials':'生成材料','matched':'分析完成','ready':'材料已准备','waiting_facts':'等待可用事实','waiting_jd':'等待补充完整 JD','failed':'失败','problem_draft':'问题草稿','reviewed':'AI 审阅通过','user_edited':'用户编辑','user_provided':'用户提供','automatic':'自动提取','running':'处理中','succeeded':'已完成','uncertain':'结果不确定','planned':'准备使用','actual':'实际使用'} %}
 {% if page=='home' %}
-<h1>我的资料</h1>{% if request.args.get("task") %}<div data-poll="/tasks/{{request.args.get('task')}}/status"></div>{% endif %}<p><a href="/preferences">设置或修改偏好</a> · <a href="/jobs">直接浏览岗位、收藏或补记投递</a></p>
-<section id="favorites"><h2>我的收藏</h2>
+<h1>我的资料</h1><p class="profile-page-actions"><a href="/preferences">求职偏好</a><span>·</span><a href="/jobs">浏览岗位</a></p>
+<section id="profile-overview" class="profile-overview">
+<div class="profile-overview-head"><div><h2>求职资料</h2><p>维护技能、经历、证书、简历和收藏。职业资料会与简历事实一起用于岗位分析、求职材料和针对性简历。</p></div>{% if profile_version %}<div class="profile-version"><strong>当前资料 #{{profile_version.id}}</strong><span>{{profile_version.created_at[:10]}}</span></div>{% endif %}</div>
+{% if profile_history|length > 1 %}<details class="profile-history"><summary>资料版本历史</summary><div class="profile-history-list">{% for v in profile_history %}<div><a href="/profile#profile-overview">资料 #{{v.id}}</a><span>{{v.created_at}}</span><small>{{v.data.skills|length}} 技能 · {{v.data.experiences|length}} 经历 · {{v.data.certificates|length}} 证书 · {{v.data.additional|length}} 补充 · {{'有头像' if v.data.avatar else '无头像'}}</small></div>{% endfor %}</div></details>{% endif %}
+</section>
+
+<div class="profile-workspace" data-profile-workspace>
+<aside class="profile-sidebar">
+<div class="profile-nav-group">
+<p class="profile-nav-label">求职文件</p>
+<nav class="profile-nav" aria-label="求职文件">
+<a href="#profile-resumes" data-profile-target="resumes" aria-controls="profile-resumes"><span>简历</span><strong>{{resumes|length}}</strong></a>
+<a href="#favorites" data-profile-target="favorites" aria-controls="favorites" aria-current="page"><span>收藏</span><strong>{{favorites|length}}</strong></a>
+<a href="#profile-delivery" data-profile-target="delivery" aria-controls="profile-delivery"><span>投递信息</span><strong>{{'已确认' if delivery_profile else '待设置'}}</strong></a>
+<a href="#profile-avatar" data-profile-target="avatar" aria-controls="profile-avatar"><span>头像</span><strong>{{'已设置' if profile_data.avatar else '待上传'}}</strong></a>
+</nav>
+</div>
+<div class="profile-nav-group">
+<p class="profile-nav-label">职业资料</p>
+<nav class="profile-nav" aria-label="职业资料分类">
+<a href="#profile-skills" data-profile-target="skills" aria-controls="profile-skills"><span>技能</span><strong>{{profile_data.skills|length}}</strong></a>
+<a href="#profile-experiences" data-profile-target="experiences" aria-controls="profile-experiences"><span>经历</span><strong>{{profile_data.experiences|length}}</strong></a>
+<a href="#profile-certificates" data-profile-target="certificates" aria-controls="profile-certificates"><span>证书</span><strong>{{profile_data.certificates|length}}</strong></a>
+<a href="#profile-additional" data-profile-target="additional" aria-controls="profile-additional"><span>补充</span><strong>{{profile_data.additional|length}}</strong></a>
+</nav>
+</div>
+</aside>
+<div class="profile-panels">
+<section id="profile-skills" class="profile-section profile-panel" data-profile-panel="skills" hidden>
+<div class="profile-section-head"><div><h2>技能</h2><p>集中整理技能，并标注熟练度和使用说明。</p></div><span class="badge">{{profile_data.skills|length}} 项</span></div>
+{% if profile_data.skills %}<div class="skill-list">{% for item in profile_data.skills %}<div class="skill-row"><div class="skill-summary"><strong>{{item.name}}</strong><span class="badge">{{item.level}}</span><details class="item-editor skill-editor"><summary>编辑</summary><form action="/profile/skills/items/{{item.id}}" method="post">{{token(url_for('profile', _anchor='profile-skills'))}}<input type="hidden" name="category" value="{{item.category}}"><div class="form-grid"><label>技能名称<input name="name" value="{{item.name}}" maxlength="100" required></label><label>熟练度<select name="level" required>{% for level in skill_levels %}<option value="{{level}}" {% if level==item.level %}selected{% endif %}>{{level}}</option>{% endfor %}</select></label><label class="span-2">技能说明<textarea name="notes" maxlength="500">{{item.notes}}</textarea></label></div><div class="form-actions"><button>保存修改</button></div></form><form action="/profile/skills/items/{{item.id}}/delete" method="post" onsubmit="return confirm('确认删除这项技能？')">{{token(url_for('profile', _anchor='profile-skills'))}}<button class="danger">删除技能</button></form></details>{% if item.notes %}<p>{{item.notes}}</p>{% endif %}</div></div>{% endfor %}</div>{% else %}<p class="empty-state">还没有技能条目。从下方添加第一项技能。</p>{% endif %}
+<details class="add-item"><summary>添加技能</summary><form action="/profile/skills/items" method="post">{{token(url_for('profile', _anchor='profile-skills'))}}<div class="form-grid"><label>技能名称<input name="name" maxlength="100" placeholder="例如：Python" required></label><label>熟练度<select name="level" required>{% for level in skill_levels %}<option value="{{level}}">{{level}}</option>{% endfor %}</select></label><label class="span-2">技能说明<textarea name="notes" maxlength="500" placeholder="使用场景、项目经验或能力边界"></textarea></label></div><div class="form-actions"><button>添加技能</button></div></form></details>
+</section>
+
+<section id="profile-experiences" class="profile-section profile-panel" data-profile-panel="experiences" hidden>
+<div class="profile-section-head"><div><h2>经历</h2><p>记录工作、实习、项目、志愿活动与学生组织经历。</p></div><span class="badge">{{profile_data.experiences|length}} 段</span></div>
+{% for item in profile_data.experiences %}<div class="profile-item"><div class="profile-item-head"><div><span class="item-kicker">{{experience_type_labels.get(item.type,item.type)}}</span><h3>{{item.role}}{% if item.organization %} · {{item.organization}}{% endif %}</h3><p>{{item.start_date}} 至 {{item.end_date or '至今'}}{% if item.location %} · {{item.location}}{% endif %}</p></div></div>{% if item.description %}<p>{{item.description}}</p>{% endif %}{% if item.achievements %}<p><strong>成果：</strong>{{item.achievements}}</p>{% endif %}
+<details class="item-editor"><summary>编辑经历</summary><form action="/profile/experiences/items/{{item.id}}" method="post">{{token(url_for('profile', _anchor='profile-experiences'))}}<div class="form-grid"><label>经历类型<select name="type" required>{% for value,label in experience_types %}<option value="{{value}}" {% if value==item.type %}selected{% endif %}>{{label}}</option>{% endfor %}</select></label><label>角色／职位<input name="role" value="{{item.role}}" maxlength="120" required></label><label>组织／项目名称<input name="organization" value="{{item.organization}}" maxlength="160"></label><label>地点<input name="location" value="{{item.location}}" maxlength="120"></label><label>开始月份<input type="month" name="start_date" value="{{item.start_date}}" required></label><label>结束月份<input type="month" name="end_date" value="{{item.end_date}}"></label><label class="span-2">经历描述<textarea name="description" maxlength="2000">{{item.description}}</textarea></label><label class="span-2">成果<textarea name="achievements" maxlength="2000" placeholder="可量化成果、职责范围或关键产出">{{item.achievements}}</textarea></label></div><div class="form-actions"><button>保存修改</button></div></form><form action="/profile/experiences/items/{{item.id}}/delete" method="post" onsubmit="return confirm('确认删除这段经历？')">{{token(url_for('profile', _anchor='profile-experiences'))}}<button class="danger">删除经历</button></form></details></div>
+{% else %}<p class="empty-state">还没有经历条目。从下方添加工作、实习或项目经历。</p>{% endfor %}
+<details class="add-item"><summary>添加经历</summary><form action="/profile/experiences/items" method="post">{{token(url_for('profile', _anchor='profile-experiences'))}}<div class="form-grid"><label>经历类型<select name="type" required>{% for value,label in experience_types %}<option value="{{value}}">{{label}}</option>{% endfor %}</select></label><label>角色／职位<input name="role" maxlength="120" required></label><label>组织／项目名称<input name="organization" maxlength="160"></label><label>地点<input name="location" maxlength="120"></label><label>开始月份<input type="month" name="start_date" required></label><label>结束月份<input type="month" name="end_date"></label><label class="span-2">经历描述<textarea name="description" maxlength="2000"></textarea></label><label class="span-2">成果<textarea name="achievements" maxlength="2000" placeholder="可量化成果、职责范围或关键产出"></textarea></label></div><div class="form-actions"><button>添加经历</button></div></form></details>
+</section>
+
+<section id="profile-certificates" class="profile-section profile-panel" data-profile-panel="certificates" hidden>
+<div class="profile-section-head"><div><h2>证书</h2><p>保存专业资格、课程证书和可验证的认证信息。</p></div><span class="badge">{{profile_data.certificates|length}} 张</span></div>
+{% for item in profile_data.certificates %}<div class="profile-item"><div class="profile-item-head"><div><span class="item-kicker">{{item.issuer}}</span><h3>{{item.name}}</h3><p>{% if item.issued_on %}获得于 {{item.issued_on}}{% else %}获得日期未填写{% endif %}{% if item.credential_url %} · <a href="{{item.credential_url}}" target="_blank" rel="noopener">查看证书</a>{% endif %}</p></div></div>{% if item.notes %}<p>{{item.notes}}</p>{% endif %}
+<details class="item-editor"><summary>编辑证书</summary><form action="/profile/certificates/items/{{item.id}}" method="post">{{token(url_for('profile', _anchor='profile-certificates'))}}<div class="form-grid"><label>证书名称<input name="name" value="{{item.name}}" maxlength="160" required></label><label>颁发机构<input name="issuer" value="{{item.issuer}}" maxlength="160" required></label><label>获得日期<input type="date" name="issued_on" value="{{item.issued_on}}"></label><label>证书链接<input type="url" name="credential_url" value="{{item.credential_url}}" maxlength="500" placeholder="https://"></label><label class="span-2">证书说明<textarea name="notes" maxlength="500">{{item.notes}}</textarea></label></div><div class="form-actions"><button>保存修改</button></div></form><form action="/profile/certificates/items/{{item.id}}/delete" method="post" onsubmit="return confirm('确认删除这张证书？')">{{token(url_for('profile', _anchor='profile-certificates'))}}<button class="danger">删除证书</button></form></details></div>
+{% else %}<p class="empty-state">还没有证书记录。从下方添加证书。</p>{% endfor %}
+<details class="add-item"><summary>添加证书</summary><form action="/profile/certificates/items" method="post">{{token(url_for('profile', _anchor='profile-certificates'))}}<div class="form-grid"><label>证书名称<input name="name" maxlength="160" required></label><label>颁发机构<input name="issuer" maxlength="160" required></label><label>获得日期<input type="date" name="issued_on"></label><label>证书链接<input type="url" name="credential_url" maxlength="500" placeholder="https://"></label><label class="span-2">证书说明<textarea name="notes" maxlength="500"></textarea></label></div><div class="form-actions"><button>添加证书</button></div></form></details>
+</section>
+
+<section id="profile-additional" class="profile-section profile-panel" data-profile-panel="additional" hidden>
+<div class="profile-section-head"><div><h2>补充资料</h2><p>记录志愿方向、个人项目、语言能力或其他职业事实。</p></div><span class="badge">{{profile_data.additional|length}} 条</span></div>
+{% for item in profile_data.additional %}<div class="profile-item"><div class="profile-item-head"><div><h3>{{item.title}}</h3></div></div><p class="pre-line">{{item.content}}</p>
+<details class="item-editor"><summary>编辑补充资料</summary><form action="/profile/additional/items/{{item.id}}" method="post">{{token(url_for('profile', _anchor='profile-additional'))}}<div class="form-grid single"><label>标题<input name="title" value="{{item.title}}" maxlength="120" required></label><label>内容<textarea name="content" maxlength="4000" required>{{item.content}}</textarea></label></div><div class="form-actions"><button>保存修改</button></div></form><form action="/profile/additional/items/{{item.id}}/delete" method="post" onsubmit="return confirm('确认删除这条补充资料？')">{{token(url_for('profile', _anchor='profile-additional'))}}<button class="danger">删除补充资料</button></form></details></div>
+{% else %}<p class="empty-state">还没有补充资料。</p>{% endfor %}
+<details class="add-item"><summary>添加补充资料</summary><form action="/profile/additional/items" method="post">{{token(url_for('profile', _anchor='profile-additional'))}}<div class="form-grid single"><label>标题<input name="title" maxlength="120" required></label><label>内容<textarea name="content" maxlength="4000" required></textarea></label></div><div class="form-actions"><button>添加补充资料</button></div></form></details>
+</section>
+
+<section id="profile-resumes" class="profile-section profile-panel" data-profile-panel="resumes" hidden>
+<div class="profile-section-head"><div><h2>简历文件</h2><p>上传文本 PDF 后自动分析，并把可验证的技能、经历、证书和补充资料合并进职业资料库。</p></div><span class="badge">{{resumes|length}} 份</span></div>
+{% if resumes %}<div class="resume-list">{% for r in resumes %}<div class="resume-row"><div class="resume-info"><a href="/resumes/{{r.id}}">{{r.filename}}</a><small>简历 #{{r.id}}</small></div>{% if selected_resume==r.id %}<span class="badge resume-current">当前使用</span>{% else %}<form action="/resumes/{{r.id}}/select" method="post">{{token()}}<button class="button secondary">使用这份</button></form>{% endif %}</div>{% endfor %}</div>{% else %}<p class="empty-state">还没有简历。上传文本 PDF 后即可用于岗位分析和材料生成。</p>{% endif %}
+{% if upload_task %}{% set task=upload_task %}{% set facts_available=upload_facts_available %}<div class="resume-import-status" data-poll="/tasks/{{upload_task.id}}/status" data-reload-on="profile-import">{% include 'task_progress.html' with context %}</div>{% endif %}
+<details class="add-item"><summary>上传新简历</summary><form action="/resumes" method="post" enctype="multipart/form-data">{{token(url_for('profile', _anchor='profile-resumes'))}}<label>PDF 文件<input type="file" name="resume" accept="application/pdf" required></label><input type="hidden" name="import_profile" value="no"><label class="checkbox-row"><input type="checkbox" name="import_profile" value="yes" checked> 自动补充职业资料库</label><p class="muted">最大 10 MB。AI 只导入能追溯到简历原文的条目，并自动跳过现有资料中的重复项；导入结果仍可在下方各分类中编辑。</p><div class="form-actions"><button>上传、分析并补充资料</button></div></form></details>
+{% if tasks %}<details class="resume-history"><summary>最近处理记录</summary><div class="resume-history-list">{% for t in tasks %}<div><a href="/tasks/{{t.id}}">{{t.created_at}}</a><span>{{t.kind}}</span><small>{{states.get(t.status,t.status)}}</small></div>{% endfor %}</div></details>{% endif %}
+</section>
+
+<section id="favorites" class="profile-section profile-panel" data-profile-panel="favorites">
+<div class="profile-section-head"><div><h2>我的收藏</h2><p>收藏的岗位会保留在资料库中，并可继续生成针对性简历。</p></div><span class="badge">{{favorites|length}} 个</span></div>
 {% if favorites %}
 {% macro fav_href(view, page=1) %}{{ url_for('profile', fav=view, p=page, _anchor='favorites') }}{% endmacro %}
 <div class="assistant-filter" role="tablist" aria-label="按是否已生成针对性简历筛选收藏">
@@ -17,22 +83,119 @@
 <a href="{{ fav_href('reports') }}" {% if fav_filter=='reports' %}aria-current="page"{% endif %} aria-pressed="{{ 'true' if fav_filter=='reports' else 'false' }}">已生成简历 <span class="badge">{{ report_favorites|length }}</span></a>
 </div>
 <p class="muted">{% if fav_filter=='pending' %}显示还没有针对性简历的收藏岗位。{% else %}显示已经生成过针对性简历的收藏岗位。{% endif %}</p>
-{% for f in listed_favorites %}<article><h3><a href="/jobs/{{f.snapshot_id}}">{{f.title}}</a></h3><p>{{f.company or '公司未提供'}} · {{'用户提供' if f.source=='manual' else f.source}} · 收藏于 {{f.created_at[:10]}}</p><form action="/jobs/{{f.snapshot_id}}/favorite" method="post">{{token(request.full_path.rstrip('?') ~ '#favorites')}}<button>取消收藏</button></form></article>
+{% for f in listed_favorites %}<div class="favorite-item"><div><h3><a href="/jobs/{{f.snapshot_id}}">{{f.title}}</a></h3><p>{{f.company or '公司未提供'}} · {{'用户提供' if f.source=='manual' else f.source}} · 收藏于 {{f.created_at[:10]}}</p></div><form action="/jobs/{{f.snapshot_id}}/favorite" method="post">{{token(request.full_path.rstrip('?') ~ '#favorites')}}<button class="button secondary">取消收藏</button></form></div>
 {% else %}<p>{% if fav_filter=='pending' %}收藏岗位都已有针对性简历。{% else %}还没有生成过针对性简历。可到「AI助手」勾选岗位后生成。{% endif %}</p>{% endfor %}
 {% if fav_total %}<nav class="pager" aria-label="收藏分页">{% if fav_page>1 %}<a class="button" href="{{ fav_href(fav_filter, fav_page-1) }}">上一页</a>{% endif %}<span>第 {{fav_page}} / {{fav_pages}} 页 · 共 {{fav_total}} 条</span>{% if fav_page<fav_pages %}<a class="button" href="{{ fav_href(fav_filter, fav_page+1) }}">下一页</a>{% endif %}</nav>{% endif %}
 {% else %}<p>暂无收藏。到<a href="/jobs">岗位页</a>点击“收藏”即可保存到这里。</p>
 {% endif %}
 </section>
-<section><h2>上传简历</h2><p>最大 10 MB 文本 PDF。自动提取事实并分析；报告失败不阻止岗位与申请管理。</p><form action="/resumes" method="post" enctype="multipart/form-data">{{token()}}<label>PDF 文件<input type="file" name="resume" accept="application/pdf" required></label><button>上传并创建分析任务</button></form></section>
-<h2>简历</h2>{% for r in resumes %}<article><a href="/resumes/{{r.id}}">{{r.filename}} · #{{r.id}}</a><form action="/resumes/{{r.id}}/select" method="post">{{token()}}<button>使用这份简历</button></form></article>{% endfor %}
-<details><summary>历史处理记录</summary>{% for t in tasks %}<p><a href="/tasks/{{t.id}}">{{t.created_at}} · {{t.kind}}</a> · {{states.get(t.status,t.status)}}</p>{% endfor %}</details>
+
+<section id="profile-delivery" class="profile-section profile-panel" data-profile-panel="delivery" hidden>
+{% set delivery_data=delivery_profile.data if delivery_profile else {} %}
+<div class="profile-section-head"><div><h2>投递信息</h2><p>姓名和联系方式只写入 PDF 页眉，不会发送给生成或审计模型。没有已确认的投递信息时，AI 助手不会生成新 PDF。</p></div>{% if delivery_profile %}<span class="badge">版本 #{{delivery_profile.id}}</span>{% else %}<span class="badge">尚未确认</span>{% endif %}</div>
+{% if delivery_profile %}<p class="delivery-version-note">当前版本确认于 {{delivery_profile.confirmed_at[:16].replace('T',' ')}}。保存相同内容会继续使用该版本；内容变化会创建新的不可变版本。</p>{% endif %}
+<form action="/profile/delivery" method="post" class="delivery-form">
+{{token(url_for('profile', _anchor='profile-delivery'))}}
+<div class="form-grid">
+<label>姓名<input name="name" value="{{delivery_data.get('name','')}}" maxlength="80" autocomplete="name" required></label>
+<label>邮箱<input type="email" name="email" value="{{delivery_data.get('email','')}}" maxlength="254" autocomplete="email"></label>
+<label>电话<input type="tel" name="phone" value="{{delivery_data.get('phone','')}}" maxlength="40" autocomplete="tel"></label>
+<label>地点<input name="location" value="{{delivery_data.get('location','')}}" maxlength="120" autocomplete="address-level2"></label>
+{% set links=delivery_data.get('links',[]) %}
+{% for index in range(5) %}<label{% if index==4 %} class="span-2"{% endif %}>链接 {{index+1}}{% if index==0 %}（最多 5 个）{% endif %}<input type="url" name="links" value="{{links[index] if index < links|length else ''}}" maxlength="500" placeholder="https://"></label>{% endfor %}
+</div>
+<div class="form-actions"><button>确认并保存投递信息</button></div>
+</form>
+</section>
+
+<section id="profile-avatar" class="profile-section profile-panel" data-profile-panel="avatar" hidden>
+{% set avatar=profile_data.avatar %}
+<div class="profile-section-head"><div><h2>头像</h2><p>头像会随当前职业资料版本进入新生成的 PDF 简历，并在下载审批时一起绑定。</p></div>{% if profile_version %}<span class="badge">资料版本 #{{profile_version.id}}</span>{% endif %}</div>
+<div class="avatar-settings" data-avatar-settings>
+<div class="avatar-preview{% if not avatar %} avatar-preview-empty{% endif %}">
+{% if avatar %}<img src="/profile/avatar/image?v={{avatar.sha256[:12]}}" alt="职业资料头像" width="{{avatar.width}}" height="{{avatar.height}}">{% else %}<span>暂无头像</span>{% endif %}
+</div>
+<div class="avatar-controls">
+{% if avatar %}<div class="avatar-meta"><strong>当前头像</strong><span>{{avatar.width}} × {{avatar.height}} · JPG</span><small>原图 {{avatar.source_width}} × {{avatar.source_height}} · 添加于 {{avatar.uploaded_at[:16].replace('T',' ')}}</small></div>{% else %}<p>上传后可预览，并在下一次生成简历时使用。</p>{% endif %}
+<form action="/profile/avatar" method="post" enctype="multipart/form-data" class="avatar-upload-form" data-avatar-crop-form data-upload-action="{{url_for('upload_profile_avatar')}}" data-adjust-action="{{url_for('adjust_profile_avatar_route')}}" data-source-url="{% if avatar %}{{url_for('profile_avatar_source')}}?v={{avatar.source_sha256[:12]}}{% endif %}" data-crop-x="{{avatar.crop.center_x if avatar else 0.5}}" data-crop-y="{{avatar.crop.center_y if avatar else 0.5}}" data-crop-zoom="{{avatar.crop.zoom if avatar else 1}}">
+{{token(url_for('profile', _anchor='profile-avatar'))}}
+<input type="hidden" name="return_to" value="{{url_for('profile', _anchor='profile-avatar')}}">
+<label class="avatar-file-picker">选择图片<input type="file" name="avatar" accept="image/jpeg,image/png,image/webp" required data-avatar-file></label>
+<p class="muted">支持 JPG、PNG、WebP，最大 5 MB；原图会保留用于重新取景，简历使用 3:4 竖版证件照。</p>
+<div class="avatar-crop-editor" data-avatar-crop-editor hidden>
+<div class="avatar-crop-layout">
+<div class="avatar-crop-stage" data-avatar-crop-stage tabindex="0" role="application" aria-label="拖动头像调整取景">
+<img data-avatar-crop-image alt="头像取景预览">
+<span class="avatar-crop-guide" aria-hidden="true"></span>
+</div>
+<div class="avatar-crop-controls">
+<label>缩放 <output data-avatar-zoom-output>100%</output><input type="range" min="1" max="3" step="0.01" value="1" data-avatar-zoom></label>
+<div class="avatar-crop-buttons">
+<button type="button" class="secondary" data-avatar-reset>重置取景</button>
+<button type="button" class="secondary" data-avatar-cancel>取消</button>
+</div>
+</div>
+</div>
+<input type="hidden" name="crop_x" value="{{avatar.crop.center_x if avatar else 0.5}}" data-avatar-crop-x>
+<input type="hidden" name="crop_y" value="{{avatar.crop.center_y if avatar else 0.5}}" data-avatar-crop-y>
+<input type="hidden" name="crop_zoom" value="{{avatar.crop.zoom if avatar else 1}}" data-avatar-crop-zoom>
+<div class="form-actions"><button data-avatar-save>保存头像</button></div>
+</div>
+<noscript><div class="form-actions"><button>上传并使用居中裁切</button></div></noscript>
+</form>
+<div class="avatar-actions">
+{% if avatar %}<button type="button" class="secondary" data-avatar-adjust>调整当前头像</button><form action="/profile/avatar/delete" method="post" class="avatar-delete-form" onsubmit="return confirm('确认从当前资料版本中移除头像？历史简历不会改变。')">{{token(url_for('profile', _anchor='profile-avatar'))}}<button class="danger">移除头像</button></form>{% endif %}
+</div>
+</div>
+</div>
+</section>
+</div>
+</div>
+<script>
+(() => {
+  const workspace = document.querySelector('[data-profile-workspace]');
+  if (!workspace) return;
+  const links = [...workspace.querySelectorAll('[data-profile-target]')];
+  const panels = [...workspace.querySelectorAll('[data-profile-panel]')];
+  const aliases = {favorites: 'favorites', resumes: 'resumes', delivery: 'delivery', avatar: 'avatar', skills: 'skills', experiences: 'experiences', certificates: 'certificates', additional: 'additional'};
+
+  function targetFromHash() {
+    const raw = location.hash.slice(1);
+    if (raw.startsWith('profile-')) return raw.slice(8);
+    return aliases[raw] || 'favorites';
+  }
+
+  function activate(target, {scroll = false, push = false} = {}) {
+    const link = links.find(item => item.dataset.profileTarget === target)
+      || links.find(item => item.dataset.profileTarget === 'favorites')
+      || links[0];
+    if (!link) return;
+    target = link.dataset.profileTarget;
+    panels.forEach(panel => { panel.hidden = panel.dataset.profilePanel !== target; });
+    links.forEach(item => {
+      if (item === link) item.setAttribute('aria-current', 'page');
+      else item.removeAttribute('aria-current');
+    });
+    const panelId = link.getAttribute('aria-controls');
+    if (push) history.pushState(null, '', `${location.pathname}${location.search}#${panelId}`);
+    if (scroll) document.getElementById(panelId)?.scrollIntoView({block: 'start'});
+  }
+
+  links.forEach(link => link.addEventListener('click', event => {
+    event.preventDefault();
+    activate(link.dataset.profileTarget, {scroll: true, push: true});
+  }));
+  window.addEventListener('hashchange', () => activate(targetFromHash(), {scroll: true}));
+  activate(targetFromHash(), {scroll: Boolean(location.hash)});
+})();
+</script>
 {% elif page=='resume' %}
 {% if mail_task %}<section data-poll="/tasks/{{mail_task.id}}/status"></section>{% endif %}
 <h1>{{resume.filename}}</h1><a href="/resumes/{{resume.id}}/pdf">下载原始 PDF</a><p class="notice">事实编辑不会改写 PDF。自动事实经程序校验后可用，不等于人工确认；如有矛盾请对照原文纠正相关条目。</p>
 <details><summary>原始提取文本</summary><pre>{{resume.text}}</pre></details>
 <form action="/resumes/{{resume.id}}/confirm" method="post"><section>{{token()}}<label>编辑事实（每行一项，新增内容视为用户提供）<textarea name="facts" rows="12" required>{{fact_lines}}</textarea></label><button>保存事实新版本</button></section></form>
 {% for v in versions %}<details><summary>事实版本 #{{v.id}} · {{states.get(v.origin,v.origin)}} · {{v.confirmed_at}}</summary>{% for f in v.facts.facts %}<p>{{f.text}} <small>来源：{{states.get(f.get('origin',v.origin),f.get('origin',v.origin))}}</small><br><small>依据：{{f.evidence}}</small></p>{% endfor %}</details>{% endfor %}
-{% for r in reports %}<section><h2>通用报告 #{{r.id}}</h2><p>分析日期（香港）：{{r.data.analysis_date}}</p><p>{{r.data.summary}}</p><ul>{% for suggestion in r.data.suggestions %}<li>{{suggestion}}</li>{% endfor %}</ul>{% if r.data.review_history|default([])|length > 1 %}<details><summary>审阅与修正记录</summary>{{review_history(r.data.review_history)}}</details>{% endif %}<form action="/email/report/{{r.id}}" method="post">{{token()}}<button>推送报告／未发送预览</button></form></section>{% else %}<p>通用报告尚未生成。已有事实仍可使用，错误见首页任务。</p>{% endfor %}
+{% for r in reports %}{% set audit_items=r.data.audit_items|default([]) %}{% set pass_count=audit_items|selectattr('status','equalto','pass')|list|length %}{% set issue_count=audit_items|selectattr('status','equalto','issue')|list|length %}<section class="audit-report"><header class="audit-report-head"><div><span class="item-kicker">AI审计</span><h2>AI审计 #{{r.id}}</h2></div><time datetime="{{r.data.analysis_date}}">审计日期（香港）<strong>{{r.data.analysis_date}}</strong></time></header><p class="audit-overview">{{r.data.summary}}</p><div class="audit-counts" aria-label="审计结果统计"><span class="audit-count audit-count-pass"><strong>{{pass_count}}</strong> 项通过</span><span class="audit-count audit-count-issue"><strong>{{issue_count}}</strong> 项需处理</span></div>{% if audit_items %}<div class="audit-list">{% for item in audit_items %}<article class="audit-item audit-{{item.status}}"><div class="audit-item-head"><span class="audit-status">{{'通过' if item.status=='pass' else '需处理'}}</span><span class="audit-category">{{item.category}}</span><h3>{{item.title}}</h3></div><p>{{item.summary}}</p>{% if item.recommendation %}<div class="audit-recommendation"><strong>{{'处理建议' if item.status=='issue' else '说明'}}</strong><span>{{item.recommendation}}</span></div>{% endif %}{% if item.evidence %}<details class="audit-evidence"><summary>查看原文依据</summary><blockquote>{{item.evidence}}</blockquote></details>{% endif %}</article>{% endfor %}</div>{% else %}<p class="empty-state">这份历史报告没有可逐项展示的审计结果。</p>{% endif %}{% if r.data.review_history|default([])|length > 1 %}<details><summary>审阅与修正记录</summary>{{review_history(r.data.review_history)}}</details>{% endif %}<form action="/email/report/{{r.id}}" method="post">{{token()}}<button>推送审计／未发送预览</button></form></section>{% else %}<p>AI审计尚未生成。已有事实仍可使用，错误见首页任务。</p>{% endfor %}
 {% elif page=='preferences' %}
 <h1>求职偏好</h1><p>点击开始搜索即保存。偏好独立于简历，修改另存版本，不改变历史匹配。</p>{% set data=preference.data if preference else {} %}
 <form method="post"><section>{{token()}}<label>目标职位（每行一个，最多 7 个）<textarea name="keywords" required>{{data.get('keywords',[])|join('\n')}}</textarea></label>{{ location_select(data.get('location','Hong Kong')) }}
@@ -60,7 +223,7 @@
 <h2>材料版本</h2>{% for m in materials %}<p><a href="/materials/{{m.id}}">材料 #{{m.id}} · 版本 {{m.version}}</a> · {{m.created_at}}</p>{% else %}<p>尚未生成材料。</p>{% endfor %}
 
 {% elif page=='material' %}
-<h1>求职材料 · 版本 {{material.version}}</h1><p><a href="/matches/{{material.match_id}}">查看匹配与依据</a> · <a href="/materials/{{material.id}}/export">导出 Markdown</a></p><p class="notice">状态：{{states.get(material.data.get('status'), '历史材料')}}。用户编辑不代表 AI 审阅通过；复制/导出不会改变状态。</p>
+<h1>求职材料 · 版本 {{material.version}}</h1><p><a href="/matches/{{material.match_id}}">查看匹配与依据</a> · <a href="/materials/{{material.id}}/export">导出 Markdown（{{'当前版本已审批' if output_approved else '首次需确认版本'}}）</a></p><p class="notice">状态：{{states.get(material.data.get('status'), '历史材料')}}。用户编辑不代表 AI 审阅通过；下载审批只绑定当前内容版本，不会改变材料状态。</p>
 {% if material.data.raw_draft %}<details><summary>生成原始草稿（结构校验详情）</summary><pre>{{material.data.raw_draft|tojson(indent=2)}}</pre></details>{% endif %}{% if material.data.review %}<ul>{% for issue in material.data.review.issues %}<li>{{issue}}</li>{% endfor %}</ul>{% endif %}
 <form method="post"><section>{{token()}}<label>求职信<textarea name="cover_letter" rows="10" required>{{material.data.cover_letter}}</textarea></label>{% for a in material.data.answers %}<label>{{a.question}}<textarea name="answer_{{loop.index0}}">{{a.answer}}</textarea></label>{% endfor %}{% for a in material.data.suggestions %}<p>原文：{{a.original}}</p><p>理由：{{a.reason}}</p><label>建议<textarea name="suggestion_{{loop.index0}}">{{a.suggested}}</textarea></label>{% endfor %}<button>保存材料新版本</button></section></form>
 <label>可复制文本<textarea id="copy-material" readonly rows="8">{{markdown}}</textarea></label><button type="button" onclick="navigator.clipboard.writeText(document.getElementById('copy-material').value).then(()=>this.textContent='已复制').catch(()=>{document.getElementById('copy-material').select();this.textContent='请按 Ctrl/Cmd+C 复制'})">复制文本</button>
@@ -76,7 +239,7 @@
 {% if task.result %}
 {% if task.result.review_issues %}<h2>内容审阅未通过</h2><p>Worker 不会自动重跑</p><ul>{% for issue in task.result.review_issues %}<li>{{issue}}</li>{% endfor %}</ul>{{review_history(task.result.review_history)}}{% endif %}
 {% if task.result.preparation_id %}<a href="/preparations/{{task.result.preparation_id}}">查看准备进度</a>{% endif %}
-{% if task.result.report_id %}<a href="/resumes/{{task.payload.resume_id}}">查看简历报告</a>{% endif %}
+{% if task.result.report_id %}<a href="/resumes/{{task.payload.resume_id}}">查看AI审计</a>{% endif %}
 {% if task.result.match_id %}<a href="/matches/{{task.result.match_id}}">查看匹配</a>{% endif %}
 {% if task.result.material_id %}<a href="/materials/{{task.result.material_id}}">查看材料</a>{% endif %}
 {% if task.kind=='search' %}<p>{{task.result.message}} 已保存 {{task.result.count}} 条。<a href="/jobs">查看岗位</a></p>{% for source,r in task.result.sources.items() %}<p>{{source}} · {{r.status}} · {{r.count}} {{r.error}}</p>{% endfor %}{% endif %}
@@ -86,5 +249,10 @@
 {% for a in attempts %}<p>{{a.created_at}} · {{a.status}} · {{a.detail}}</p>{% endfor %}
 {% elif page=='error' %}<h1>操作提示</h1><p class="notice">{{error}}</p><a href="/">返回首页</a>{% endif %}
 </main><script>
-document.querySelectorAll('[data-poll]').forEach(el=>{async function refresh(){try{let r=await fetch(el.dataset.poll);if(r.ok)el.innerHTML=await r.text()}catch(e){} }refresh();setInterval(refresh,2000)});
-</script></body></html>
+document.querySelectorAll('[data-poll]').forEach(el=>{async function refresh(){try{let r=await fetch(el.dataset.poll);if(r.ok){let text=await r.text();if(text!==el.innerHTML){el.innerHTML=text;document.dispatchEvent(new CustomEvent('career:motion-refresh',{detail:{element:el}}));if(el.dataset.reloadOn==='profile-import'&&text.includes('data-profile-import-complete')){location.reload();return;}}}}catch(e){} }refresh();setInterval(refresh,2000)});
+</script>
+<script src="{{ url_for('static', filename='vendor/gsap/gsap.min.js') }}" defer></script>
+<script src="{{ url_for('static', filename='vendor/gsap/ScrollTrigger.min.js') }}" defer></script>
+<script src="{{ url_for('static', filename='motion.js') }}" defer></script>
+<script src="{{ url_for('static', filename='avatar_crop.js') }}" defer></script>
+</body></html>

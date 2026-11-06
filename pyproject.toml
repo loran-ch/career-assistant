@@ -20,4 +20,4 @@ dependencies = {file = ["requirements.txt"]}
 where = ["src"]
 
 [tool.setuptools.package-data]
-career_assistant = ["templates/*.html", "static/*"]
+career_assistant = ["templates/*.html", "static/*", "skills/*/SKILL.md"]

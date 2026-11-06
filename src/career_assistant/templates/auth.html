@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{ '注册' if mode == 'register' else '登录' }} · 智能求职助手</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='workspace.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='motion.css') }}">
+</head>
+<body class="auth-body">
+  <header class="auth-header">
+    <a class="auth-brand" href="/">
+      <span class="auth-logo" aria-hidden="true">CA</span>
+      <span>Career Assistant</span>
+    </a>
+    <span class="auth-local">本机账户</span>
+  </header>
+
+  <main class="auth-main">
+    <section class="auth-panel" aria-labelledby="auth-title">
+      <p class="auth-kicker">{{ '首次使用' if mode == 'register' else '欢迎回来' }}</p>
+      <h1 id="auth-title">{{ '创建本机账户' if mode == 'register' else '登录求职助手' }}</h1>
+      <p class="auth-lead">
+        {{ '设置一个账户来保护你的简历、岗位和申请记录。' if mode == 'register' else '输入账户信息以继续管理求职进度。' }}
+      </p>
+
+      {% for message in get_flashed_messages() %}
+      <p class="notice" role="status">{{ message }}</p>
+      {% endfor %}
+      {% if error %}
+      <p class="auth-error" role="alert">{{ error }}</p>
+      {% endif %}
+
+      <form class="auth-form" method="post">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        {% if next_url %}<input type="hidden" name="next" value="{{ next_url }}">{% endif %}
+        <label>
+          <span>用户名</span>
+          <input name="username" value="{{ username }}" autocomplete="username"
+                 minlength="3" maxlength="32" required autofocus>
+        </label>
+        <label>
+          <span>密码</span>
+          <input type="password" name="password" autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}"
+                 minlength="8" maxlength="128" required>
+          {% if mode == 'register' %}<small>至少 8 个字符</small>{% endif %}
+        </label>
+        {% if mode == 'register' %}
+        <label>
+          <span>确认密码</span>
+          <input type="password" name="password_confirm" autocomplete="new-password"
+                 minlength="8" maxlength="128" required>
+        </label>
+        {% endif %}
+        <button class="auth-submit" type="submit">{{ '创建账户' if mode == 'register' else '登录' }}</button>
+      </form>
+
+      <p class="auth-switch">
+        {% if mode == 'register' %}
+        已经创建账户？<a href="{{ url_for('login', next=next_url) if next_url else url_for('login') }}">返回登录</a>
+        {% else %}
+        首次使用？<a href="{{ url_for('register', next=next_url) if next_url else url_for('register') }}">创建账户</a>
+        {% endif %}
+      </p>
+    </section>
+  </main>
+
+  <footer class="auth-footer">账户与求职数据仅保存在这台电脑上</footer>
+  <script src="{{ url_for('static', filename='vendor/gsap/gsap.min.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='vendor/gsap/ScrollTrigger.min.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='motion.js') }}" defer></script>
+</body>
+</html>

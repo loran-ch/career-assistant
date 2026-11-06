@@ -9,10 +9,14 @@
 !/requirements.txt
 !/config.example.yaml
 !/.env.example
+!/.dockerignore
+!/Dockerfile
+!/docker-compose.yml
 !/src/
 !/docs/
 /docs/*
 !/docs/UPSTREAM.md
+!/docs/KAFKA_DOCKER.md
 /src/*
 !/src/career_assistant/
 !/data/
@@ -29,6 +33,7 @@ Thumbs.db
 .env
 .env.*
 !/.env.example
+!/.env.docker.example
 *.db
 !/data/radar.db
 *.db-*

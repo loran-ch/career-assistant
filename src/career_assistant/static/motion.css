@@ -1,0 +1,163 @@
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(22, 102, 117, 0.2);
+}
+
+a,
+button,
+input,
+select,
+textarea,
+article,
+section {
+  transition:
+    border-color 180ms ease,
+    background-color 180ms ease,
+    box-shadow 220ms ease,
+    color 180ms ease;
+}
+
+button,
+.button {
+  box-shadow: 0 2px 0 rgba(16, 57, 68, 0.16);
+}
+
+button:hover:not([disabled]),
+.button:hover {
+  background-color: #115965;
+  box-shadow: 0 5px 14px rgba(16, 57, 68, 0.18);
+}
+
+button:focus-visible,
+.button:focus-visible,
+a:focus-visible {
+  outline: 3px solid rgba(230, 166, 74, 0.64);
+  outline-offset: 3px;
+}
+
+button[disabled] {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+input:not([type="checkbox"]):hover,
+textarea:hover,
+select:hover {
+  border-color: #78919a;
+}
+
+input:not([type="checkbox"]):focus,
+textarea:focus,
+select:focus {
+  border-color: #166675;
+  box-shadow: 0 0 0 3px rgba(22, 102, 117, 0.12);
+  outline: none;
+}
+
+article,
+section {
+  box-shadow: 0 1px 2px rgba(20, 56, 83, 0.035);
+}
+
+article:hover,
+section:hover {
+  box-shadow: 0 8px 24px rgba(20, 56, 83, 0.075);
+}
+
+.notice,
+.auth-error {
+  box-shadow: inset 3px 0 0 rgba(185, 121, 31, 0.3);
+}
+
+.auth-error {
+  box-shadow: inset 3px 0 0 #b7473d;
+}
+
+.app-nav > a {
+  position: relative;
+  padding: 4px 0;
+}
+
+.app-nav > a::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 1px;
+  background: #e6a64a;
+  content: "";
+  transform: scaleX(0);
+  transform-origin: right;
+  transition: transform 220ms ease;
+}
+
+.app-nav > a:hover::after,
+.app-nav > a:focus-visible::after {
+  transform: scaleX(1);
+  transform-origin: left;
+}
+
+.assistant-jobs label {
+  border-radius: 6px;
+  transition:
+    background-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.assistant-jobs label:has(input:checked) {
+  background: #e8f2f3;
+  box-shadow: inset 3px 0 0 #166675;
+}
+
+.assistant-jobs label:hover {
+  background: #edf3f6;
+}
+
+.assistant-job-group:not([hidden]) {
+  animation: group-in 240ms ease both;
+}
+
+.chat-log .msg {
+  transform-origin: left top;
+}
+
+form.is-submitting {
+  cursor: progress;
+}
+
+@keyframes group-in {
+  from {
+    opacity: 0.72;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  article:hover,
+  section:hover {
+    box-shadow: 0 1px 2px rgba(20, 56, 83, 0.035);
+  }
+}

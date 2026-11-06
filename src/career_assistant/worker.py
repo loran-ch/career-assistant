@@ -116,15 +116,23 @@ class Worker:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
-        self._acquire_and_recover()
+        self.open()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="career-worker", daemon=True)
         try:
             self._thread.start()
         except BaseException:
             self._thread = None
-            self.lock.release()
+            self.close()
             raise
+
+    def open(self) -> None:
+        """Acquire the single-worker lock and recover an interrupted owner."""
+        if self.lock.handle is None:
+            self._acquire_and_recover()
+
+    def close(self) -> None:
+        self.lock.release()
 
     def stop(self, timeout: float = 5.0) -> bool:
         self._stop.set()
@@ -139,18 +147,26 @@ class Worker:
                 if not self.run_once():
                     self._stop.wait(self.poll_interval)
         finally:
-            self._cleanup_and_release()
+            self.close()
 
     def _cleanup_and_release(self) -> None:
-        self.lock.release()
+        self.close()
 
-    def _claim(self) -> dict | None:
+    def _claim(self, task_id: int | None = None) -> dict | None:
         with self.store.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT * FROM course_tasks WHERE status='queued' AND kind!='fill' AND available_at<=? "
-                "AND attempts<max_attempts ORDER BY id LIMIT 1", (stamp(),)
-            ).fetchone()
+            if task_id is None:
+                row = conn.execute(
+                    "SELECT * FROM course_tasks WHERE status='queued' AND kind!='fill' "
+                    "AND available_at<=? AND attempts<max_attempts ORDER BY id LIMIT 1",
+                    (stamp(),),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM course_tasks WHERE id=? AND status='queued' "
+                    "AND kind!='fill' AND available_at<=? AND attempts<max_attempts",
+                    (task_id, stamp()),
+                ).fetchone()
             if row is None:
                 return None
             conn.execute(
@@ -176,49 +192,72 @@ class Worker:
             task = self._claim()
             if task is None:
                 return False
-            try:
-                handler = self.handlers.get(task["kind"])
-                if handler is None:
-                    raise DefiniteTaskFailure(f"未注册任务处理器：{task['kind']}")
-                # No database transaction is held during network/browser/AI I/O.
-                result = handler(task)
-                serialized = encode(result)
-            except Exception as exc:
-                if isinstance(exc, DefiniteTaskFailure):
-                    status = "failed"
-                elif task["side_effect"]:
-                    status = "uncertain"
-                elif task["attempts"] < task["max_attempts"]:
-                    status = "queued"
-                else:
-                    status = "failed"
-                available = to_iso(now_hk() + timedelta(seconds=min(30, 2 ** task["attempts"])))
-                with self.store.connect() as conn:
-                    conn.execute(
-                        "UPDATE course_tasks SET status=?, error=?, available_at=?, "
-                        "finished_at=?, updated_at=? WHERE id=? AND owner=?",
-                        (status, safe_error(exc), available,
-                         None if status == "queued" else stamp(), stamp(), task["id"], self.owner),
-                    )
-            else:
-                # SMTP returning a known refusal or an ambiguous DATA outcome
-                # is a completed *attempt*, not a successful task. Neither is
-                # automatically replayed; explicit retries retain the old row.
-                outcome = result.get("status") if isinstance(result, dict) else None
-                status = outcome if outcome in {"failed", "uncertain"} else "succeeded"
-                error = ""
-                if status != "succeeded":
-                    error = safe_error(DefiniteTaskFailure(
-                        result.get("error") or result.get("detail") or status
-                    ))
-                with self.store.connect() as conn:
-                    conn.execute(
-                        "UPDATE course_tasks SET status=?, result_json=?, "
-                        "error=?, finished_at=?, updated_at=? WHERE id=? AND owner=?",
-                        (status, serialized, error, stamp(), stamp(), task["id"], self.owner),
-                    )
+            self._process_claimed(task)
             return True
         finally:
             if temporary_lock and self.lock.handle is not None:
-                self._cleanup_and_release()
+                self.close()
             self._run_guard.release()
+
+    def process_task_by_id(self, task_id: int) -> bool:
+        """Process one Kafka-delivered task without polling unrelated SQLite rows."""
+        if (self._thread and self._thread.is_alive()
+                and threading.current_thread() is not self._thread):
+            raise RuntimeError("后台 Worker 运行期间不能在其他线程执行任务")
+        if not self._run_guard.acquire(blocking=False):
+            return False
+        temporary_lock = self.lock.handle is None
+        try:
+            if temporary_lock:
+                self.open()
+            task = self._claim(int(task_id))
+            if task is None:
+                return False
+            self._process_claimed(task)
+            return True
+        finally:
+            if temporary_lock and self.lock.handle is not None:
+                self.close()
+            self._run_guard.release()
+
+    def _process_claimed(self, task: dict) -> None:
+        try:
+            handler = self.handlers.get(task["kind"])
+            if handler is None:
+                raise DefiniteTaskFailure(f"未注册任务处理器：{task['kind']}")
+            # No database transaction is held during network/browser/AI I/O.
+            result = handler(task)
+            serialized = encode(result)
+        except Exception as exc:
+            if isinstance(exc, DefiniteTaskFailure):
+                status = "failed"
+            elif task["side_effect"]:
+                status = "uncertain"
+            elif task["attempts"] < task["max_attempts"]:
+                status = "queued"
+            else:
+                status = "failed"
+            available = to_iso(now_hk() + timedelta(seconds=min(30, 2 ** task["attempts"])))
+            with self.store.connect() as conn:
+                conn.execute(
+                    "UPDATE course_tasks SET status=?, error=?, available_at=?, "
+                    "finished_at=?, updated_at=? WHERE id=? AND owner=?",
+                    (status, safe_error(exc), available,
+                     None if status == "queued" else stamp(), stamp(), task["id"], self.owner),
+                )
+        else:
+            # SMTP returning a known refusal or an ambiguous DATA outcome is a
+            # completed attempt, not a successful task. It is never replayed.
+            outcome = result.get("status") if isinstance(result, dict) else None
+            status = outcome if outcome in {"failed", "uncertain"} else "succeeded"
+            error = ""
+            if status != "succeeded":
+                error = safe_error(DefiniteTaskFailure(
+                    result.get("error") or result.get("detail") or status
+                ))
+            with self.store.connect() as conn:
+                conn.execute(
+                    "UPDATE course_tasks SET status=?, result_json=?, "
+                    "error=?, finished_at=?, updated_at=? WHERE id=? AND owner=?",
+                    (status, serialized, error, stamp(), stamp(), task["id"], self.owner),
+                )

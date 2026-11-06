@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>INT6181 · 审批与下载</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='workspace.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='motion.css') }}">
+</head>
+<body>
+{% include '_app_header.html' %}
+{% from '_form_macros.html' import token with context %}
+<main class="approval-page">
+{% for message in get_flashed_messages() %}<p class="notice">{{message}}</p>{% endfor %}
+<header class="approval-head">
+  <div>
+    <span class="item-kicker">{{output.kind_label}}</span>
+    <h1>审批当前交付版本</h1>
+    <p>请核对文件、来源与独立审计结果。审批只对当前文件指纹有效，文件变化后必须重新审批。</p>
+  </div>
+  <span class="approval-kind">{{'PDF 文件' if output.artifact_kind=='pdf' else ('材料 Markdown' if output.artifact_type=='material' else '历史 Markdown')}}</span>
+</header>
+
+{% if existing_approval %}
+<section class="approval-existing">
+  <div>
+    <h2>当前版本已审批</h2>
+    <p>审批记录 #{{existing_approval.id}} · {{existing_approval.approved_at}}。如果文件指纹发生变化，旧审批会自动失效。</p>
+  </div>
+  {% if output.can_export %}<a class="button" href="{{output.download_url}}">{{'下载 PDF' if output.artifact_kind=='pdf' else ('下载求职材料' if output.artifact_type=='material' else '下载历史文件')}}</a>{% endif %}
+</section>
+{% endif %}
+
+<section class="approval-risk{{' approval-risk-neutral' if output.refusal_level in ['allow','warn'] else ''}}">
+  <strong>边界结论：{{output.refusal_label}}（{{output.refusal_level|upper}} · {{output.boundary.policy_version}}）</strong>
+  <span>拒绝会绑定到具体动作；同一份草稿可以在禁止导出的同时允许保存或人工复核。</span>
+</section>
+
+<section class="boundary-actions" aria-label="各动作的边界结论">
+  {% for action_code, action in output.boundary.actions.items() %}
+  <div class="boundary-action boundary-action-{{action.level}}">
+    <span>{{action.action_label}}</span>
+    <strong>{{action.level_label}}</strong>
+    <small>{{'允许执行' if action.allowed else '当前禁止'}}</small>
+  </div>
+  {% endfor %}
+</section>
+
+{% if output.integrity_error %}
+<section class="approval-risk" role="alert">
+  <strong>文件完整性检查未通过，已禁止审批和下载</strong>
+  <span>{{output.integrity_error}}</span>
+</section>
+{% endif %}
+{% if output.legacy %}
+<section class="approval-risk approval-risk-neutral" role="alert">
+  <strong>这是一份历史 Markdown 简历</strong>
+  <span>该版本没有结构化文档、PDF 指纹或独立审计报告。审批只绑定当前 Markdown 内容，不能证明其事实准确性。</span>
+</section>
+{% elif output.audit_status=='issue' %}
+<section class="approval-risk" role="alert">
+  <strong>独立审计发现需要处理的问题</strong>
+  <span>这些问题不一定会阻止下载，但请确认你能解释并承担最终提交内容。审批不会把审计问题标记为已修复。</span>
+</section>
+{% endif %}
+
+<section class="approval-summary">
+  <div class="approval-title-row">
+    <div>
+      <span class="item-kicker">交付内容</span>
+      <h2>{{output.title}}</h2>
+    </div>
+    <span class="approval-audit approval-audit-{{output.audit_status}}">{{output.audit_label}}</span>
+  </div>
+
+  <div class="approval-grid">
+    <div class="approval-field"><span>文件格式</span><strong>{{'PDF' if output.artifact_kind=='pdf' else ('求职材料 Markdown' if output.artifact_type=='material' else 'Markdown')}}</strong></div>
+    <div class="approval-field"><span>页数</span><strong>{{output.page_count if output.page_count else '不适用'}}</strong></div>
+    <div class="approval-field"><span>模板版本</span><strong>{{output.template_version or '历史版本'}}</strong></div>
+    <div class="approval-field"><span>渲染器版本</span><strong>{{output.renderer_version or '不适用'}}</strong></div>
+  </div>
+
+  <div class="approval-hash">
+    <span>{{'PDF 文件 SHA-256' if output.artifact_kind=='pdf' else 'Markdown 内容 SHA-256'}}</span>
+    <code>{{output.content_hash or '未记录'}}</code>
+    <small>审批与下载都以此指纹为准；重新生成会产生新的指纹和新的审批要求。</small>
+  </div>
+  {% if output.artifact_kind=='pdf' %}
+  <div class="approval-hash">
+    <span>结构化文档 SHA-256</span>
+    <code>{{output.document_sha256 or '未记录'}}</code>
+    <small>用于区分事实结构化内容与最终 PDF 文件字节。PDF 排版或字体变化会改变上方 PDF 指纹，但不一定改变此指纹。</small>
+  </div>
+  {% endif %}
+
+  {% if output.artifact_kind=='pdf' and output.pdf_url and not output.integrity_error %}
+  <details class="approval-preview" open>
+    <summary>预览当前 PDF</summary>
+    <iframe class="approval-pdf-frame" src="{{output.pdf_url}}" title="{{output.title}} PDF 预览"></iframe>
+  </details>
+  {% elif output.artifact_kind=='pdf' %}
+  <p class="empty-state">PDF 文件不可读取，因此不提供预览。</p>
+  {% else %}
+  <details class="approval-preview">
+    <summary>查看历史 Markdown 内容</summary>
+    <pre>{{output.content}}</pre>
+  </details>
+  {% endif %}
+
+  <section class="approval-sources">
+    <h3>版本来源</h3>
+    <dl>
+      {% for source in output.source_versions %}
+      <div>
+        <dt>{{source.label}}</dt>
+        <dd class="{{'approval-missing' if source.value in [none,'','未找到'] else ''}}">{{source.value if source.value not in [none,''] else '未找到'}}</dd>
+      </div>
+      {% endfor %}
+    </dl>
+  </section>
+</section>
+
+<section class="approval-audit-section">
+  <div class="profile-section-head">
+    <div>
+      <span class="item-kicker">独立审计</span>
+      <h2>逐项分析</h2>
+      <p>{{output.audit_summary or '这份文件没有可用的独立审计总结。'}}</p>
+    </div>
+    {% set pass_count=output.audit_findings|selectattr('status','equalto','pass')|list|length %}
+    {% set issue_count=output.audit_findings|selectattr('status','equalto','issue')|list|length %}
+    <div class="audit-counts">
+      <span class="audit-count audit-count-pass"><strong>{{pass_count}}</strong> 项通过</span>
+      <span class="audit-count audit-count-issue"><strong>{{issue_count}}</strong> 项需处理</span>
+    </div>
+  </div>
+  {% if output.audit_findings %}
+  <div class="audit-list approval-audit-list">
+    {% for finding in output.audit_findings %}
+    <article class="audit-item audit-{{finding.status}}">
+      <div class="audit-item-head">
+        <span class="audit-status">{{'通过' if finding.status=='pass' else '需处理'}}</span>
+        <span class="audit-category">{{finding.section}}</span>
+        <h3>{{finding.title}}</h3>
+      </div>
+      <p>{{finding.detail}}</p>
+      {% if finding.fact_ids %}
+      <details class="audit-evidence">
+        <summary>相关事实编号</summary>
+        <p><code>{{finding.fact_ids|join(', ')}}</code></p>
+      </details>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty-state">没有逐项审计结果。请把这种情况视为未经独立审计，而不是默认通过。</p>
+  {% endif %}
+</section>
+
+{% if output.boundary_checks %}
+<details class="audit-evidence approval-sources">
+  <summary>查看边界检查记录</summary>
+  <dl>
+    {% for check in output.boundary_checks %}
+    <div>
+      <dt><code>{{check.code}}</code><br><small>{{check.group_label}}</small></dt>
+      <dd>
+        <strong>{{check.summary}}</strong><br>
+        <small>{{check.stage_label}} · {{check.level_label}}</small>
+        {% if check.affected_action_labels %}<br><small>影响动作：{{check.affected_action_labels|join('、')}}</small>{% endif %}
+        {% if check.remediation %}<br><small>处理方式：{{check.remediation}}</small>{% endif %}
+      </dd>
+    </div>
+    {% endfor %}
+  </dl>
+</details>
+{% endif %}
+
+{% if not existing_approval and output.can_approve %}
+<form class="approval-confirm-form" method="post" action="{{output.approve_url}}">
+  {{token()}}
+  <input type="hidden" name="content_hash" value="{{output.content_hash}}">
+  <label class="approval-check">
+    <input type="checkbox" name="confirm_review" value="yes" required>
+    <span>我已核对当前{{' PDF 文件' if output.artifact_kind=='pdf' else '历史内容'}}、版本来源和独立审计结果，并理解审批只代表当前文件指纹。</span>
+  </label>
+  <div class="approval-actions">
+    <a class="button secondary" href="{{output.return_url}}">返回查看</a>
+    <button type="submit">确认并下载</button>
+  </div>
+</form>
+{% else %}
+<p class="approval-actions"><a class="button secondary" href="{{output.return_url}}">返回查看</a></p>
+{% endif %}
+</main>
+<script src="{{ url_for('static', filename='vendor/gsap/gsap.min.js') }}" defer></script>
+<script src="{{ url_for('static', filename='vendor/gsap/ScrollTrigger.min.js') }}" defer></script>
+<script src="{{ url_for('static', filename='motion.js') }}" defer></script>
+</body>
+</html>

@@ -7,12 +7,32 @@ from __future__ import annotations
 
 import contextvars
 import os
+from pathlib import Path
 import re
 import time
 import uuid
 from urllib.parse import urlparse
 
-from career_assistant.ai import AIError, minimize_personal_data
+from career_assistant.ai import AIService, AIError, minimize_personal_data
+from career_assistant.profile_context import (
+    merge_profile_facts,
+    normalize_profile_data,
+    profile_context_text,
+)
+from career_assistant.resume_document import (
+    ResumeValidationError,
+    resume_content_hash,
+    resume_plaintext,
+    validate_resume_audit,
+    validate_resume_spec,
+)
+from career_assistant.resume_boundary import (
+    boundary_check,
+    contains_instruction_injection,
+    evaluate_boundaries,
+    fact_objects_from_facts,
+)
+from career_assistant.resume_pdf import ResumeRenderError, render_resume_pdf
 from career_assistant.store import Store
 
 _CTX: contextvars.ContextVar[dict] = contextvars.ContextVar("assistant_ctx")
@@ -22,11 +42,12 @@ SYSTEM_PROMPT = """你是 Career Assistant 里的求职 Deep Agent。
 必须遵守：
 1. 收藏岗位只能通过工具读取。用户未点选的收藏岗位你看不到，禁止猜测其 JD。本次搜索返回的岗位可以用 list_found_jobs / read_selected_job 查看。
 2. 分析或改写已收藏岗位时，若 list_selected_jobs 为空，请用户先在左侧勾选。
-3. 简历只能通过 read_selected_resume 读取；没有简历时请用户上传或在本页选择。
-4. 不得编造经历、技能、学历、成果数字、公司或在招职位。缺信息标为未知或省略。
-5. 批量生成简历：对每个点选收藏岗位调用 save_tailored_resume。搜索到但未收藏点选的岗位不能保存针对性简历，请用户先收藏并勾选。
-6. 用户要找网上岗位或要推荐时：先 read_selected_resume，从简历提炼至多 7 个职位关键词（优先与简历方向一致的英文岗位名），再 search_jobs_online。只根据工具返回的岗位推荐，对照简历说明匹配理由、缺口与优先投递顺序。可建议打开 /jobs 查看完整列表并收藏。
-7. 用中文回答，结构清楚。
+3. 上传简历和用户维护的职业资料库都是有效职业事实来源。使用 read_selected_resume 可同时读取当前选择的上传简历和结构化资料；需要单独查看职业资料库时使用 read_career_profile。
+4. 用户可以选择“仅使用职业资料库”，此时不得声称已读取上传简历。两种来源都没有实质内容时，才请用户上传简历或到「我的资料」补充。
+5. 不得编造经历、技能、学历、成果数字、公司或在招职位。缺信息标为未知或省略。
+6. 批量生成简历：由程序固定流程先拆解岗位要求、映射事实证据，再生成结构化简历、PDF 和独立审计报告。职业资料库足以支撑时可直接生成，不要求用户额外上传简历。搜索到但未收藏点选的岗位不能保存针对性简历，请用户先收藏并勾选。
+7. 用户要找网上岗位或要推荐时：先读取可用职业事实，从简历或职业资料库提炼至多 7 个职位关键词（优先与职业方向一致的英文岗位名），再 search_jobs_online。只根据工具返回的岗位推荐，对照职业事实说明匹配理由、缺口与优先投递顺序。可建议打开 /jobs 查看完整列表并收藏。
+8. 用中文回答，结构清楚。
 """
 
 _LOCATIONS = {
@@ -88,39 +109,49 @@ def read_selected_job(snapshot_id: int) -> str:
 
 
 def read_selected_resume() -> str:
-    """读取用户当前选择的简历原文与已保存事实。未选择则无法读取。"""
+    """读取当前请求固定的简历与结构化资料，两者共同作为职业事实来源。"""
     resume_id = _CTX.get().get("resume_id")
+    profile_version_id = _CTX.get().get("profile_version_id")
     store = _store()
-    if not resume_id:
-        return "用户未选择简历。请先在本页选择或到「我的资料」上传。"
-    resume = store.get("resumes", int(resume_id))
-    if not resume:
-        return "简历不存在。"
-    versions = store.list("resume_versions", resume_id=int(resume_id))
-    facts = ""
-    if versions:
-        items = (versions[0].get("facts") or {}).get("facts") or []
-        facts = "\n".join(f"- {row.get('text','')}" for row in items if row.get("text"))
-    text = (resume.get("text") or "")[:12000]
-    return minimize_personal_data(
-        f"简历文件：{resume.get('filename')}\n\n事实：\n{facts or '（尚无提取事实）'}\n\n原文摘录：\n{text or '（无文本）'}"
+    versions = store.list("resume_versions", resume_id=int(resume_id)) if resume_id else []
+    resume = store.get("resumes", int(resume_id)) if resume_id else None
+    parts = []
+    if resume_id and not resume:
+        parts.append("选择的上传简历不存在。")
+    elif resume:
+        facts = ""
+        if versions:
+            items = (versions[0].get("facts") or {}).get("facts") or []
+            facts = "\n".join(f"- {row.get('text','')}" for row in items if row.get("text"))
+        text = (resume.get("text") or "")[:12000]
+        parts.extend([
+            f"上传简历：{resume.get('filename')}",
+            f"简历事实：\n{facts or '（尚无提取事实）'}",
+            f"简历原文摘录：\n{text or '（无文本）'}",
+        ])
+    else:
+        parts.append("上传简历：未选择")
+    profile_version = (
+        store.get("profile_versions", profile_version_id) if profile_version_id else None
     )
+    profile_text = profile_context_text(profile_version["data"] if profile_version else {})
+    parts.append(f"用户维护的结构化资料：\n{profile_text or '（尚未填写）'}")
+    if not resume and not profile_text:
+        return "当前没有可用的上传简历或职业资料库内容。请先选择一份简历，或到「我的资料」添加技能、经历、证书或补充资料。"
+    return minimize_personal_data("\n\n".join(parts))
 
 
-def save_tailored_resume(snapshot_id: int, title: str, body: str) -> str:
-    """为已点选的某一个岗位保存一版针对性简历。批量生成时每个岗位各调用一次。保存后可在该岗位详情页查看和下载。"""
-    if snapshot_id not in _selected_ids():
-        return f"岗位 #{snapshot_id} 未点选，不能保存针对性简历。"
-    resume_id = _CTX.get().get("resume_id")
-    try:
-        record_id = _store().save_tailored_resume(snapshot_id, resume_id, title, body)
-    except ValueError as exc:
-        return str(exc)
-    item = _store().get("job_snapshots", snapshot_id) or {}
-    return (
-        f"已保存针对性简历 #{record_id}，对应 {item.get('title') or snapshot_id}。"
-        f"请到岗位页 /jobs/{snapshot_id} 查看和下载。"
+def read_career_profile() -> str:
+    """读取当前请求固定版本的用户职业资料库；不读取上传简历。"""
+    profile_version_id = _CTX.get().get("profile_version_id")
+    profile_version = (
+        _store().get("profile_versions", profile_version_id) if profile_version_id else None
     )
+    text = profile_context_text(profile_version["data"] if profile_version else {})
+    if not text:
+        return "职业资料库还没有内容。请用户到「我的资料」添加技能、经历、证书或补充资料。"
+    version = profile_version.get("version") if profile_version else "未知"
+    return minimize_personal_data(f"职业资料库版本：v{version}\n\n{text}")
 
 
 def _split_csv(value: str) -> list[str]:
@@ -234,8 +265,14 @@ def _agent():
     global _AGENT
     if _AGENT is None:
         from deepagents import create_deep_agent
-        tools = [list_selected_jobs, list_found_jobs, read_selected_job, read_selected_resume,
-                 save_tailored_resume, search_jobs_online]
+        tools = [
+            list_selected_jobs,
+            list_found_jobs,
+            read_selected_job,
+            read_selected_resume,
+            read_career_profile,
+            search_jobs_online,
+        ]
         _AGENT = create_deep_agent(
             model=_model(),
             tools=tools,
@@ -244,13 +281,7 @@ def _agent():
                 {
                     "name": "match_analyst",
                     "description": "对照点选岗位或搜索结果与简历做匹配度分析。",
-                    "system_prompt": "只用工具中的岗位与简历。不得编造。用中文给出匹配、缺口与建议。",
-                    "tools": tools,
-                },
-                {
-                    "name": "resume_writer",
-                    "description": "按用户要求为每个点选岗位改写并保存针对性简历。",
-                    "system_prompt": "只用简历原文里有的经历。每个点选岗位单独生成并调用 save_tailored_resume。不得编造技能或成果。",
+                    "system_prompt": "只用工具中的岗位、简历与结构化资料。不得编造。用中文给出匹配、缺口与建议。",
                     "tools": tools,
                 },
                 {
@@ -287,7 +318,7 @@ _TOOL_STATUS = {
     "list_found_jobs": "正在整理搜索结果…",
     "read_selected_job": "正在读取岗位介绍…",
     "read_selected_resume": "正在读取简历…",
-    "save_tailored_resume": "正在保存针对性简历…",
+    "read_career_profile": "正在读取职业资料库…",
     "search_jobs_online": "正在搜索网上岗位，可能需要一两分钟…",
     "task": "正在调用子任务…",
 }
@@ -313,44 +344,246 @@ def _wants_tailored_resumes(message: str) -> bool:
     return any(key in text for key in ("针对性简历", "对应简历", "生成简历", "改写简历", "为每个勾选"))
 
 
-_RESUME_SYS = """你根据对照简历，为单一岗位写针对性简历正文（Markdown）。
-只用简历里出现的经历、技能、学历和成果。不得编造公司、数字、职级或项目。
-岗位介绍缺失时，按职位名称调整措辞，不要假装见过官方 JD。
-直接输出完整简历正文，不要前言后语。中文为主，专有名词可保留英文。"""
+def _boundary_refusal_text(
+    code: str,
+    detail: str,
+    *,
+    title: str = "",
+) -> str:
+    check = boundary_check(code)
+    prefix = f"「{title}」" if title else ""
+    return (
+        f"\n\n{prefix}未生成：{check.level.label}"
+        f"（{check.level.value.upper()} · {check.code}）。{detail}\n"
+    )
 
 
 def _generate_tailored_resumes():
     ids = sorted(_selected_ids())
     if not ids:
-        yield {"type": "token", "text": "请先在左侧勾选收藏岗位，再让我生成针对性简历。未勾选的岗位不会保存。"}
+        yield {
+            "type": "token",
+            "text": _boundary_refusal_text(
+                "preflight_jobs_missing",
+                "请先在左侧勾选收藏岗位。未勾选的岗位不会保存。",
+            ),
+        }
         return
-    resume = read_selected_resume()
-    if resume.startswith("用户未选择") or resume.startswith("简历不存在"):
-        yield {"type": "token", "text": resume + "\n生成针对性简历需要先在本页选择或到「我的资料」上传简历。"}
+    store = _store()
+    delivery = store.latest_delivery_profile()
+    if delivery is None:
+        yield {
+            "type": "token",
+            "text": _boundary_refusal_text(
+                "preflight_delivery_missing",
+                (
+                    "请先到「我的资料 -> 投递信息」确认姓名。"
+                    "姓名和联系方式只用于 PDF 页眉，不会发送给生成或审计模型。"
+                ),
+            ),
+        }
         return
-    from langchain_core.messages import HumanMessage, SystemMessage
-    model = _model()
+
+    context = _CTX.get()
+    resume_id = context.get("resume_id")
+    resume_version_id = context.get("resume_version_id")
+    profile_version_id = context.get("profile_version_id")
+    resume_facts: dict = {}
+    if resume_id:
+        resume_version = (
+            store.get("resume_versions", resume_version_id)
+            if resume_version_id
+            else None
+        )
+        if resume_version:
+            resume_facts = resume_version.get("facts") or {}
+    profile_version = (
+        store.get("profile_versions", profile_version_id)
+        if profile_version_id
+        else None
+    )
+    profile_data = normalize_profile_data(profile_version["data"] if profile_version else {})
+    facts = merge_profile_facts(
+        resume_facts,
+        profile_data,
+    )
+    if not facts.get("facts"):
+        yield {
+            "type": "token",
+            "text": _boundary_refusal_text(
+                "preflight_facts_missing",
+                (
+                    "当前没有可用于生成简历的职业事实。"
+                    "请上传简历，或到「我的资料」添加技能、经历、证书或补充资料。"
+                ),
+            ),
+        }
+        return
+
+    fact_objects = fact_objects_from_facts(facts)
+    known_fact_ids = {
+        str(row.get("id") or "")
+        for row in facts["facts"]
+        if isinstance(row, dict) and row.get("id")
+    }
+    ai = AIService(timeout=120, attempts=2)
+    pdf_dir = Path(store.path).parent / "course_resume_pdfs"
     for snapshot_id in ids:
-        item = _store().get("job_snapshots", snapshot_id) or {}
+        item = store.get("job_snapshots", snapshot_id) or {}
         title = item.get("title") or f"岗位 {snapshot_id}"
-        yield {"type": "status", "text": f"正在为「{title}」生成针对性简历…"}
-        yield {"type": "token", "text": f"\n\n## {title}\n\n"}
-        job = read_selected_job(snapshot_id)
-        parts: list[str] = []
-        try:
-            for chunk in model.stream([
-                SystemMessage(content=_RESUME_SYS),
-                HumanMessage(content=f"对照简历：\n{resume}\n\n目标岗位：\n{job}\n"),
-            ]):
-                text = _message_text(chunk)
-                if text:
-                    parts.append(text)
-                    yield {"type": "token", "text": text}
-        except Exception as exc:
-            yield {"type": "token", "text": f"\n生成失败（{type(exc).__name__}）。\n"}
+        jd = str(item.get("jd") or "").strip()
+        stage = "planning"
+        if contains_instruction_injection(jd):
+            yield {
+                "type": "token",
+                "text": _boundary_refusal_text(
+                    "input_instruction_detected",
+                    (
+                        "岗位描述包含疑似覆盖既有约束的指令文本。"
+                        "该内容只会被当作不可信岗位文本处理，请清理后重新生成。"
+                    ),
+                    title=title,
+                ),
+            }
             continue
-        result = save_tailored_resume(snapshot_id, f"{title} · 针对性简历", "".join(parts))
-        yield {"type": "token", "text": f"\n\n{result}\n"}
+        yield {"type": "status", "text": f"正在为「{title}」拆解岗位要求并筛选证据…"}
+        try:
+            plan = ai.plan_resume(facts, jd, title)
+            checks = [boundary_check("generation_passed")]
+            selected_fact_ids = sorted(
+                {
+                    fact_id
+                    for row in plan.get("evidence_map") or []
+                    for fact_id in row.get("fact_ids") or []
+                }
+            )
+            stage = "writing"
+            yield {"type": "status", "text": f"正在按照岗位策略撰写「{title}」…"}
+            draft = ai.write_resume(facts, jd, title, plan=plan)
+            yield {"type": "status", "text": f"「{title}」正在进行事实、数字与日期校验…"}
+            spec = validate_resume_spec(draft, facts)
+            checks.append(boundary_check("writer_passed"))
+            stage = "artifact"
+            yield {"type": "status", "text": f"「{title}」正在生成 A4 PDF…"}
+            pdf = render_resume_pdf(
+                spec,
+                delivery["data"],
+                pdf_dir,
+                avatar=profile_data["avatar"],
+            )
+            checks.append(
+                boundary_check(
+                    "artifact_rendered",
+                    evidence_refs=(str(pdf["pdf_sha256"]),),
+                )
+            )
+            stage = "audit"
+            yield {"type": "status", "text": f"「{title}」正在由独立审计角色逐项核验…"}
+            audit_raw = ai.audit_resume(facts, jd, title, spec)
+            audit = validate_resume_audit(audit_raw, known_fact_ids)
+            checks.append(
+                boundary_check(
+                    "audit_review_required" if not audit["approved"] else "audit_passed",
+                    evidence_refs=selected_fact_ids,
+                )
+            )
+            body = resume_plaintext(spec, delivery["data"])
+            content_hash = resume_content_hash(spec)
+            boundary = evaluate_boundaries(
+                checks,
+                fact_objects=fact_objects,
+                subject={
+                    "snapshot_id": snapshot_id,
+                    "resume_version_id": resume_version_id,
+                    "profile_version_id": profile_version_id,
+                    "delivery_profile_id": delivery["id"],
+                    "fact_count": len(facts["facts"]),
+                    "selected_fact_count": len(selected_fact_ids),
+                    "fact_ids": selected_fact_ids,
+                    "content_sha256": content_hash,
+                    "pdf_sha256": pdf["pdf_sha256"],
+                },
+            )
+            record_id = store.save_tailored_resume(
+                snapshot_id=snapshot_id,
+                resume_id=resume_id,
+                title=f"{title} · 针对性简历",
+                body=body,
+                resume_version_id=resume_version_id,
+                profile_version_id=profile_version_id,
+                delivery_profile_id=delivery["id"],
+                document=spec,
+                audit=audit,
+                plan=plan,
+                boundary=boundary.to_dict(),
+                pdf_path=pdf["path"],
+                pdf_sha256=pdf["pdf_sha256"],
+                content_sha256=content_hash,
+                template_version=pdf["template_version"],
+                renderer_version=pdf["renderer_version"],
+                page_count=pdf["page_count"],
+                artifact_status="audit_pass" if audit["approved"] else "audit_issue",
+            )
+        except ResumeValidationError as exc:
+            message = str(exc).strip() or type(exc).__name__
+            code = exc.boundary_code or {
+                "planning": "plan_generation_failed",
+                "writing": "writer_generation_failed",
+                "artifact": "pdf_render_failed",
+                "audit": "audit_structure_invalid",
+            }[stage]
+            yield {"type": "token", "text": _boundary_refusal_text(code, message, title=title)}
+            continue
+        except (AIError, ResumeRenderError, ValueError) as exc:
+            message = str(exc).strip() or type(exc).__name__
+            code = {
+                "planning": "plan_generation_failed",
+                "writing": "writer_generation_failed",
+                "artifact": "pdf_render_failed",
+                "audit": "audit_structure_invalid",
+            }[stage]
+            yield {"type": "token", "text": _boundary_refusal_text(code, message, title=title)}
+            continue
+        except Exception as exc:
+            code = {
+                "planning": "plan_generation_failed",
+                "writing": "writer_generation_failed",
+                "artifact": "pdf_render_failed",
+                "audit": "audit_structure_invalid",
+            }[stage]
+            yield {
+                "type": "token",
+                "text": _boundary_refusal_text(
+                    code,
+                    f"{type(exc).__name__}：{str(exc).strip() or '未知错误'}",
+                    title=title,
+                ),
+            }
+            continue
+
+        audit_label = "独立审计通过" if audit["approved"] else "独立审计发现问题"
+        refusal = boundary.level
+        issue_lines = [
+            f"- {row['title']}：{row['detail']}"
+            for row in audit["findings"]
+            if row["status"] == "issue"
+        ]
+        report = [
+            f"\n\n## {title}\n",
+            f"PDF 简历 #{record_id} 已生成，{audit_label}，共 {pdf['page_count']} 页。",
+            (
+                f"边界结论：{refusal.label}"
+                f"（{refusal.value.upper()} · {boundary.policy_version}）"
+            ),
+            f"审计总结：{audit['summary']}",
+        ]
+        if issue_lines:
+            report.append("需处理：\n" + "\n".join(issue_lines))
+        report.append(
+            f"查看与下载：/jobs/{snapshot_id}/resumes/{record_id}"
+            "（首次下载前需要人工审批当前 PDF 版本。）"
+        )
+        yield {"type": "token", "text": "\n".join(report)}
 
 
 def stream_assistant(store: Store, message: str, snapshot_ids: list[int], resume_id: int | None,
@@ -359,7 +592,18 @@ def stream_assistant(store: Store, message: str, snapshot_ids: list[int], resume
     allowed = {item["snapshot_id"] for item in store.list_favorites()}
     visible = [int(i) for i in snapshot_ids if int(i) in allowed]
     found = [int(i) for i in (search_ids or [])]
-    token = _CTX.set({"store": store, "snapshot_ids": visible, "resume_id": resume_id, "search_ids": found})
+    latest_profile = store.latest_profile_version()
+    profile_version_id = latest_profile["id"] if latest_profile else None
+    versions = store.list("resume_versions", resume_id=int(resume_id)) if resume_id else []
+    resume_version_id = versions[0]["id"] if versions else None
+    token = _CTX.set({
+        "store": store,
+        "snapshot_ids": visible,
+        "resume_id": resume_id,
+        "resume_version_id": resume_version_id,
+        "profile_version_id": profile_version_id,
+        "search_ids": found,
+    })
     os.environ.setdefault("LANGSMITH_TRACING", "false")
     try:
         messages = list(history or [])

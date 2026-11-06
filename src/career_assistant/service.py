@@ -14,6 +14,7 @@ from career_assistant.config import CONFIG_PATH, load_config
 from career_assistant.db import Database
 from career_assistant.models import HK_TZ, JobPosting
 from career_assistant.scheduler import Scheduler, _JOB_DEFAULTS
+from .profile_context import PROFILE_SECTIONS, empty_profile_data, merge_profile_facts
 from .store import Store, encode, stamp
 
 
@@ -66,8 +67,6 @@ def handlers(store: Store, upload_dir: Path, base_url: str, ai=None):
     def analyze(task):
         resume = require(store, "resumes", task["payload"]["resume_id"])
         existing = store.list("reports", task_id=task["id"])
-        if existing:
-            return {"report_id": existing[0]["id"]}
         raw = resume_path(resume["path"]).read_bytes()
         if hashlib.sha256(raw).hexdigest() != resume["sha256"]:
             raise ValueError("上传原始 PDF 已改变；请重新上传，不能使用改变后的内容生成原报告")
@@ -81,9 +80,34 @@ def handlers(store: Store, upload_dir: Path, base_url: str, ai=None):
                                 origin="automatic", extraction_task_id=task["id"])
             store.resume_waiting(resume["id"])
         engine = service()
-        data = engine.analyze(text, facts=cached[0]["facts"] if cached else None, on_facts=save_facts)
-        report_id = store.save_report(resume["id"], data, task_id=task["id"])
-        return {"report_id": report_id}
+        if existing:
+            report = existing[0]
+            report_id = report["id"]
+            data = report["data"]
+        else:
+            data = engine.analyze(text, facts=cached[0]["facts"] if cached else None, on_facts=save_facts)
+            report_id = store.save_report(resume["id"], data, task_id=task["id"])
+        result = {"report_id": report_id}
+        if task["payload"].get("import_profile", False):
+            try:
+                extracted = engine.extract_profile(
+                    text,
+                    {"facts": data.get("facts", [])},
+                )
+                imported = store.merge_profile_items(extracted["items"])
+                imported["skipped_during_extraction"] = extracted["skipped"]
+                imported["skipped_total"] = extracted["skipped"] + imported["invalid_total"]
+                result["profile_import"] = imported
+            except (AIError, ValueError) as exc:
+                result["profile_import"] = {
+                    "error": str(exc),
+                    "added": {section: 0 for section in PROFILE_SECTIONS},
+                    "added_total": 0,
+                    "duplicates": {section: 0 for section in PROFILE_SECTIONS},
+                    "duplicates_total": 0,
+                    "skipped_total": 0,
+                }
+        return result
 
     def search(task):
         preference = require(store, "preferences", task["payload"]["preference_id"])
@@ -120,12 +144,16 @@ def handlers(store: Store, upload_dir: Path, base_url: str, ai=None):
                 "snapshot_ids": list(dict.fromkeys(snapshots)), "count": len(set(snapshots)),
                 "message": "部分成功：有来源失败，不能判定全范围无结果。" if partial else "全部来源失败。" if failed else "全部来源成功，未发现岗位。" if not snapshots else "全部来源成功，候选已保存。"}
 
-    def match_result(version, snapshot, preference_id):
+    def match_result(version, profile_version, snapshot, preference_id):
         engine = service()
         preference = store.get("preferences", preference_id) if preference_id else None
+        facts = merge_profile_facts(
+            version["facts"],
+            profile_version["data"] if profile_version else empty_profile_data(),
+        )
         if isinstance(engine, AIService):
-            return engine.match(version["facts"], snapshot["jd"], preferences=preference["data"] if preference else None)
-        return engine.match(version["facts"], snapshot["jd"])
+            return engine.match(facts, snapshot["jd"], preferences=preference["data"] if preference else None)
+        return engine.match(facts, snapshot["jd"])
 
     def match(task):
         p = task["payload"]
@@ -134,11 +162,23 @@ def handlers(store: Store, upload_dir: Path, base_url: str, ai=None):
             return {"match_id": existing[0]["id"]}
         preference = store.get("preferences", p.get("preference_id")) if p.get("preference_id") else None
         version = require(store, "resume_versions", p["resume_version_id"])
+        profile_version_id = p.get("profile_version_id")
+        if profile_version_id is None:
+            latest_profile = store.latest_profile_version()
+            profile_version_id = latest_profile["id"] if latest_profile else None
+        profile_version = require(store, "profile_versions", profile_version_id)
         snapshot = require(store, "job_snapshots", p["snapshot_id"])
         if not snapshot["is_full"]:
             raise ValueError("请先补充完整 JD；摘要不能用于详细匹配")
-        match_id = store.save_match(version["id"], snapshot["id"], match_result(version, snapshot, preference["id"] if preference else None),
-                                   preference_id=preference["id"] if preference else None, task_id=task["id"])
+        match_id = store.save_match(
+            version["id"],
+            snapshot["id"],
+            match_result(version, profile_version, snapshot,
+                         preference["id"] if preference else None),
+            preference_id=preference["id"] if preference else None,
+            task_id=task["id"],
+            profile_version_id=profile_version["id"],
+        )
         return {"match_id": match_id}
 
     def materials(task):
@@ -149,16 +189,24 @@ def handlers(store: Store, upload_dir: Path, base_url: str, ai=None):
                     "error": "材料未通过校验或审阅" if item["data"].get("status") == "problem_draft" else ""}
         match = require(store, "matches", task["payload"]["match_id"])
         version = require(store, "resume_versions", match["resume_version_id"])
+        profile_version = (
+            store.get("profile_versions", match["profile_version_id"])
+            if match.get("profile_version_id") else None
+        )
+        facts = merge_profile_facts(
+            version["facts"],
+            profile_version["data"] if profile_version else empty_profile_data(),
+        )
         snapshot = require(store, "job_snapshots", match["snapshot_id"])
         from .worker import safe_error
         cp = task.get("checkpoint") or {}
         try:
             engine = service()
             if isinstance(engine, AIService):
-                data = engine.materials(version["facts"], snapshot["jd"], match["data"],
+                data = engine.materials(facts, snapshot["jd"], match["data"],
                     checkpoint=cp, on_checkpoint=lambda value: store.checkpoint(task["id"], value))
             else:
-                data = engine.materials(version["facts"], snapshot["jd"], match["data"])
+                data = engine.materials(facts, snapshot["jd"], match["data"])
             if data.get("status") == "waiting_input":
                 return data
             data["status"] = "reviewed"
@@ -220,6 +268,12 @@ def handlers(store: Store, upload_dir: Path, base_url: str, ai=None):
                 store.update_preparation(pid, state="waiting_facts", error="请选择或上传简历，取得可用事实。")
                 return {"preparation_id": pid, "status": "waiting_input"}
             version = require(store, "resume_versions", record["resume_version_id"])
+            profile_version_id = record["profile_version_id"]
+            if profile_version_id is None:
+                latest_profile = store.latest_profile_version()
+                profile_version_id = latest_profile["id"] if latest_profile else None
+                store.update_preparation(pid, profile_version_id=profile_version_id)
+            profile_version = require(store, "profile_versions", profile_version_id)
             snapshot = require(store, "job_snapshots", record["snapshot_id"])
             if not snapshot["is_full"]:
                 store.update_preparation(pid, state="fetching_jd", error="")
@@ -236,9 +290,19 @@ def handlers(store: Store, upload_dir: Path, base_url: str, ai=None):
             match_id = record["match_id"]
             if not match_id:
                 store.update_preparation(pid, state="matching", error="")
-                existing = [m for m in store.list("matches", resume_version_id=version["id"], snapshot_id=snapshot["id"]) if m["preference_id"] == record["preference_id"]]
+                existing = [
+                    m for m in store.list(
+                        "matches",
+                        resume_version_id=version["id"],
+                        snapshot_id=snapshot["id"],
+                        profile_version_id=profile_version["id"],
+                    )
+                    if m["preference_id"] == record["preference_id"]
+                ]
                 match_id = existing[0]["id"] if existing else store.save_match(version["id"], snapshot["id"],
-                    match_result(version, snapshot, record["preference_id"]), preference_id=record["preference_id"], task_id=task["id"])
+                    match_result(version, profile_version, snapshot, record["preference_id"]),
+                    preference_id=record["preference_id"], task_id=task["id"],
+                    profile_version_id=profile_version["id"])
                 store.update_preparation(pid, match_id=match_id)
             store.update_preparation(pid, state="matched", error="")
             return {"preparation_id": pid, "match_id": match_id}

@@ -1,7 +1,7 @@
 <!doctype html><html lang="zh-Hans"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>INT6181 · 求职助手</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='workspace.css') }}"></head><body>
-<header><strong>Career Assistant · 智能求职助手</strong><nav><a href="/jobs">岗位</a><a href="/assistant">AI助手</a><a href="/applications">申请</a><a href="/profile">我的资料</a><a href="/settings">设置</a></nav></header><main>{% for message in get_flashed_messages() %}<p class="notice">{{message}}</p>{% endfor %}{% if session.get("form_error") %}<p class="notice" role="alert">{{session.pop("form_error")}}</p>{% endif %}
-{% from 'page.html' import token, resume_select, preference_select, location_select with context %}
+<link rel="stylesheet" href="{{ url_for('static', filename='workspace.css') }}"><link rel="stylesheet" href="{{ url_for('static', filename='motion.css') }}"></head><body>
+{% include '_app_header.html' %}<main>{% for message in get_flashed_messages() %}<p class="notice">{{message}}</p>{% endfor %}{% if session.get("form_error") %}<p class="notice" role="alert">{{session.pop("form_error")}}</p>{% endif %}
+{% from 'page.html' import resume_select, preference_select, location_select with context %}{% from '_form_macros.html' import token with context %}
 {% if page=='jobs' %}
 {% macro job_card(j) %}<article class="job-card">
 <div class="job-card-head">
@@ -70,11 +70,21 @@
 <section><h2>针对性简历</h2>
 <p class="muted">由 AI 助手按本岗位生成。到「AI助手」勾选该岗位后可批量生成；未勾选则不会出现在这里。</p>
 {% for r in tailored_resumes %}
-<article>
+<article class="tailored-summary-row">
+<div>
 <h3>{{r.title}}</h3>
-<p class="muted">{{r.created_at[:16].replace('T',' ')}}</p>
-<p><a class="button" href="/jobs/{{snapshot.id}}/resumes/{{r.id}}">查看</a>
-<a class="button" href="/jobs/{{snapshot.id}}/resumes/{{r.id}}/download">下载</a></p>
+<p class="muted">{{r.created_at[:16].replace('T',' ')}} · {{r.page_count or '—'}} 页</p>
+<div class="tailored-badges">
+{% if r.artifact_status=='audit_pass' %}<span class="artifact-badge artifact-pass">PDF · 审计通过</span>
+{% elif r.artifact_status=='audit_issue' %}<span class="artifact-badge artifact-issue">PDF · 审计有问题</span>
+{% else %}<span class="artifact-badge artifact-legacy">历史 Markdown</span>{% endif %}
+<span class="artifact-badge {{'artifact-approved' if r.output_approved else 'artifact-pending'}}">{{'当前版本已审批' if r.output_approved else '等待人工审批'}}</span>
+<span class="artifact-badge {{'artifact-issue' if r.refusal_level=='block' else ('artifact-pending' if r.refusal_level in ['warn','review'] else 'artifact-pass')}}">{{'硬拒绝' if r.refusal_level=='block' else ('提醒' if r.refusal_level=='warn' else ('需人工复核' if r.refusal_level=='review' else '边界通过'))}}</span>
+</div>
+</div>
+<div class="tailored-actions"><a class="button" href="/jobs/{{snapshot.id}}/resumes/{{r.id}}">查看</a>
+<a class="button" href="/jobs/{{snapshot.id}}/resumes/{{r.id}}/download">下载{{' PDF' if r.artifact_status in ['audit_pass','audit_issue'] else '历史文件'}}</a>
+<form action="/jobs/{{snapshot.id}}/resumes/{{r.id}}/delete" method="post" onsubmit="return confirm('确认删除这份针对性简历？它会从岗位和 AI 助手中移除，但审批记录与底层审计版本仍会保留。')">{{token()}}<button class="danger">删除</button></form></div>
 </article>
 {% else %}
 <p>尚未生成本岗位简历。打开<a href="/assistant">AI助手</a>，勾选本岗位后选择「为每个勾选岗位各生成一版针对性简历」。</p>
@@ -89,12 +99,50 @@
 {% elif page=='tailored_resume' %}
 <h1>{{item.title}}</h1>
 <p class="muted">对应岗位：<a href="/jobs/{{snapshot.id}}">{{snapshot.title}}</a> · {{snapshot.company or '公司未提供'}} · {{item.created_at[:16].replace('T',' ')}}</p>
-<p><a class="button" href="/jobs/{{snapshot.id}}/resumes/{{item.id}}/download">下载 Markdown</a></p>
-<section><h2>简历正文</h2><pre>{{item.body}}</pre></section>
+<div class="tailored-badges">
+{% if output.artifact_kind=='pdf' %}<span class="artifact-badge artifact-pass">PDF · {{output.page_count}} 页</span>
+{% else %}<span class="artifact-badge artifact-legacy">历史 Markdown</span>{% endif %}
+<span class="artifact-badge {{'artifact-approved' if output_approved else 'artifact-pending'}}">{{'当前版本已审批' if output_approved else '下载前需人工审批'}}</span>
+<span class="artifact-badge {{'artifact-issue' if output.audit_status=='issue' else ('artifact-pass' if output.audit_status=='pass' else 'artifact-legacy')}}">{{output.audit_label}}</span>
+<span class="artifact-badge {{'artifact-issue' if output.refusal_level=='block' else ('artifact-pending' if output.refusal_level in ['warn','review'] else 'artifact-pass')}}">{{output.refusal_label}}</span>
+</div>
+{% if output.integrity_error %}<p class="notice" role="alert"><strong>文件完整性检查未通过：</strong>{{output.integrity_error}}。审批和下载已禁用。</p>{% endif %}
+{% if output.legacy %}
+<p class="notice" role="alert"><strong>历史版本：</strong>此简历没有结构化文档、PDF 指纹或独立审计报告，只能作为历史内容查看。</p>
+{% endif %}
+<div class="tailored-download tailored-actions"><a class="button" href="/jobs/{{snapshot.id}}/resumes/{{item.id}}/download">下载{{' PDF' if output.artifact_kind=='pdf' else '历史 Markdown'}}（{{'当前版本已审批' if output_approved else ('当前边界禁止导出' if not output.can_export else '首次需确认版本')}}）</a>
+<form action="/jobs/{{snapshot.id}}/resumes/{{item.id}}/delete" method="post" onsubmit="return confirm('确认删除这份针对性简历？它会从岗位和 AI 助手中移除，但审批记录与底层审计版本仍会保留。')">{{token()}}<button class="danger">删除针对性简历</button></form></div>
+{% if output.artifact_kind=='pdf' %}
+<section class="resume-preview-section"><div class="profile-section-head"><div><h2>PDF 预览</h2><p>预览的是审批和下载所绑定的同一份 PDF 文件。</p></div></div>
+{% if output.integrity_error %}<p class="empty-state">PDF 文件不可读取，因此不提供预览。</p>{% else %}<iframe class="resume-pdf-frame" src="{{output.pdf_url}}" title="{{item.title}} PDF 预览"></iframe>{% endif %}
+</section>
+{% else %}
+<section><h2>历史 Markdown 内容</h2><pre>{{item.body}}</pre></section>
+{% endif %}
+<section class="resume-audit-section">
+<div class="profile-section-head"><div><span class="item-kicker">AI审计</span><h2>逐项分析</h2><p>{{output.audit_summary or '这份历史文件没有独立审计总结。'}}</p></div>
+{% set pass_count=output.audit_findings|selectattr('status','equalto','pass')|list|length %}
+{% set issue_count=output.audit_findings|selectattr('status','equalto','issue')|list|length %}
+<div class="audit-counts"><span class="audit-count audit-count-pass"><strong>{{pass_count}}</strong> 项通过</span><span class="audit-count audit-count-issue"><strong>{{issue_count}}</strong> 项需处理</span></div></div>
+{% if output.audit_findings %}<div class="audit-list resume-audit-list">{% for finding in output.audit_findings %}<article class="audit-item audit-{{finding.status}}"><div class="audit-item-head"><span class="audit-status">{{'通过' if finding.status=='pass' else '需处理'}}</span><span class="audit-category">{{finding.section}}</span><h3>{{finding.title}}</h3></div><p>{{finding.detail}}</p></article>{% endfor %}</div>
+{% else %}<p class="empty-state">没有逐项审计结果。请把这种情况视为未经独立审计，而不是默认通过。</p>{% endif %}
+</section>
+<details class="resume-versions">
+<summary>版本、边界与文件指纹</summary>
+<dl>
+<div><dt>边界结论</dt><dd>{{output.refusal_label}} · {{output.refusal_level|upper}} · {{output.boundary.policy_version}}</dd></div>
+<div><dt>动作级结论</dt><dd>{% for action_code, action in output.boundary.actions.items() %}{{action.action_label}}：{{action.level_label}}{{'；' if not loop.last}}{% endfor %}</dd></div>
+{% for check in output.boundary_checks %}<div><dt><code>{{check.code}}</code><br><small>{{check.group_label}}</small></dt><dd><strong>{{check.summary}}</strong><br><small>{{check.stage_label}} · {{check.level_label}}</small>{% if check.affected_action_labels %}<br><small>影响动作：{{check.affected_action_labels|join('、')}}</small>{% endif %}{% if check.remediation %}<br><small>处理方式：{{check.remediation}}</small>{% endif %}</dd></div>{% endfor %}
+<div><dt>PDF SHA-256</dt><dd><code>{{output.pdf_sha256 or '不适用'}}</code></dd></div>
+<div><dt>结构化文档 SHA-256</dt><dd><code>{{output.document_sha256 or '不适用'}}</code></dd></div>
+<div><dt>模板／渲染器</dt><dd>{{output.template_version or '历史版本'}} · {{output.renderer_version or '不适用'}}</dd></div>
+{% for source in output.source_versions %}<div><dt>{{source.label}}</dt><dd>{{source.value if source.value not in [none,''] else '未找到'}}</dd></div>{% endfor %}
+</dl>
+</details>
 <p><a href="/jobs/{{snapshot.id}}">返回岗位</a></p>
 {% elif page=='assistant' %}
 <h1>AI 助手</h1>
-<p class="muted">基于 Deep Agent。只有左侧<strong>勾选</strong>的收藏岗位会进入助手可见范围；未勾选的收藏 JD 不会发给模型。也可让助手结合简历搜索网上岗位并推荐；搜索到的岗位会保存到「岗位」页。</p>
+<p class="muted">基于 Deep Agent。只有左侧<strong>勾选</strong>的收藏岗位会进入助手可见范围；未勾选的收藏 JD 不会发给模型。助手可以使用上传简历和「我的资料」职业资料库生成材料、分析岗位或搜索推荐；搜索到的岗位会保存到「岗位」页。</p>
 {% if not ai_ready %}<p class="notice" role="alert">未配置 RADAR_AI_API_KEY、RADAR_AI_BASE_URL、RADAR_AI_MODEL，发送后会提示配置错误。到「设置」查看说明。</p>{% endif %}
 <div class="assistant-layout">
 <section class="assistant-jobs">
@@ -130,19 +178,28 @@
 {{ date_groups(ready_groups, 'ready', '还没有生成过针对性简历。') }}
 </div>
 </div>
-<label>对照简历<select id="assistant-resume" name="resume_id">{% for r in resumes %}<option value="{{r.id}}" {% if r.id==selected_resume %}selected{% endif %}>{{r.filename}} · #{{r.id}}</option>{% else %}<option value="">尚未上传简历</option>{% endfor %}</select></label>
+<label class="assistant-source-select">职业事实来源<select id="assistant-resume" name="resume_id"><option value="profile" {% if not selected_resume %}selected{% endif %}>不使用上传简历，仅使用职业资料库</option>{% for r in resumes %}<option value="{{r.id}}" {% if r.id==selected_resume %}selected{% endif %}>{{r.filename}} · #{{r.id}}</option>{% endfor %}</select></label>
+<div class="assistant-profile-source" data-profile-source {% if profile_has_content %}data-ready="true"{% else %}data-ready="false"{% endif %}>
+<div class="assistant-profile-source-head"><strong>职业资料库</strong>{% if profile_version %}<span>v{{ profile_version.version }}</span>{% endif %}</div>
+{% if profile_has_content %}
+<p>技能 {{ profile_counts.skills }} · 经历 {{ profile_counts.experiences }} · 证书 {{ profile_counts.certificates }} · 补充 {{ profile_counts.additional }}</p>
+<p><a href="/profile#profile-skills">管理职业资料</a>{% if profile_version and profile_version.created_at %} · 更新于 {{ profile_version.created_at[:16].replace('T',' ') }}{% endif %}</p>
+{% else %}
+<p>还没有资料内容。可<a href="/profile#profile-skills">到「我的资料」添加技能、经历、证书或补充资料</a>。</p>
+{% endif %}
+</div>
 <p id="assistant-select-status" class="muted">已点选 {{ selected_jobs|length }} 个岗位</p>
 </form>
 {% else %}
 <p>还没有收藏岗位。<a href="/jobs">到岗位页收藏</a>后再回来勾选。</p>
 {% endif %}
-<p class="muted">{% if resumes %}当前简历：{% if selected_resume %}#{{selected_resume}}{% else %}未选择{% endif %}{% else %}请先到<a href="/profile">我的资料</a>上传简历。{% endif %}</p>
+<p class="muted">{% if selected_resume %}当前会同时参考职业资料库与上传简历 #{{ selected_resume }}。{% elif profile_has_content %}当前仅使用职业资料库，不会读取上传简历。{% elif resumes %}当前仅使用职业资料库，但资料库还没有内容；也可选择上方简历。{% else %}当前没有可用职业事实。请到<a href="/profile">我的资料</a>添加资料或上传简历。{% endif %}</p>
 </section>
 <section>
 <h2>对话</h2>
-<div id="chat-log" class="chat-log" aria-live="polite">{% for m in messages %}<div class="msg"><div class="role">{{'你' if m.role=='user' else '助手'}}</div><div class="bubble">{{m.content}}</div></div>{% else %}<p class="muted">可先勾选岗位，或让助手结合简历搜索网上岗位并推荐。</p>{% endfor %}</div>
+<div id="chat-log" class="chat-log" aria-live="polite">{% for m in messages %}<div class="msg"><div class="role">{{'你' if m.role=='user' else '助手'}}</div><div class="bubble">{{m.content}}</div></div>{% else %}<p class="muted">可先勾选岗位，再让助手结合职业资料库生成简历、分析匹配度或搜索岗位。</p>{% endfor %}</div>
 <p class="muted">快捷：</p>
-<p class="assistant-hints">{% for hint in ['结合我的简历搜索网上岗位并给出推荐','对照简历分析已勾选岗位的匹配度','列出缺口技能，不要编造经历','为每个勾选岗位各生成一版针对性简历并保存到对应岗位页','按勾选岗位写一封简短求职信'] %}<button type="button" class="hint" data-hint="{{hint}}">{{hint}}</button>{% endfor %}</p>
+<p class="assistant-hints">{% for hint in ['仅根据我的职业资料库，为勾选岗位生成并保存针对性简历','结合我的职业资料库搜索网上岗位并给出推荐','对照职业资料库分析已勾选岗位的匹配度','列出缺口技能，不要编造经历','按勾选岗位写一封简短求职信'] %}<button type="button" class="hint" data-hint="{{hint}}">{{hint}}</button>{% endfor %}</p>
 <form id="assistant-form">
 <label>你的要求<textarea id="assistant-input" name="message" required placeholder="说明要分析哪些岗位、或要生成什么材料"></textarea></label>
 <button id="assistant-send" type="submit">发送</button>
@@ -167,6 +224,7 @@ document.querySelectorAll('[data-poll]').forEach(el=>{
     let text=await r.text();
     if(text!==el.innerHTML){
      el.innerHTML=text;
+     document.dispatchEvent(new CustomEvent('career:motion-refresh',{detail:{element:el}}));
      const statusEl=el.querySelector('[data-task-status]');
      if(el.dataset.reloadOn&&statusEl&&el.dataset.reloadOn.split(',').includes(statusEl.dataset.taskStatus)){location.reload();return}
     }
@@ -189,10 +247,12 @@ async function assistantSelect(){
  if(!form)return;
  const ids=[...form.querySelectorAll('input[name=snapshot_ids]:checked')].map(el=>Number(el.value));
  const resume=document.getElementById('assistant-resume');
- const r=await fetch('/assistant/select',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({csrf,snapshot_ids:ids,resume_id:resume&&resume.value?Number(resume.value):null})});
+ const resumeId=resume&&resume.value&&resume.value!=='profile'?Number(resume.value):null;
+ const source=resume&&resume.selectedOptions[0]?resume.selectedOptions[0].textContent:'职业资料库';
+ const r=await fetch('/assistant/select',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({csrf,snapshot_ids:ids,resume_id:resumeId})});
  const data=await r.json();
  const st=document.getElementById('assistant-select-status');
- if(st)st.textContent=data.ok?'已点选 '+data.count+' 个岗位，未勾选的岗位助手看不到':'保存点选失败';
+ if(st)st.textContent=data.ok?'已点选 '+data.count+' 个岗位 · 来源：'+source:'保存点选失败';
 }
 const selectForm=document.getElementById('assistant-select-form');
 if(selectForm)selectForm.addEventListener('change',assistantSelect);
@@ -205,6 +265,7 @@ function showAssistantGroup(name){
  document.querySelectorAll('[data-filter-group]').forEach(btn=>{
   btn.setAttribute('aria-pressed', btn.dataset.filterGroup===name?'true':'false');
  });
+ if(window.CareerMotion)window.CareerMotion.revealAssistantGroup();
 }
 document.querySelectorAll('[data-filter-group]').forEach(btn=>{
  btn.addEventListener('click',()=>showAssistantGroup(btn.dataset.filterGroup));
@@ -238,6 +299,7 @@ function sortAssistantJobs(dir){
  const old=document.getElementById('assistant-sort-old');
  if(neu)neu.setAttribute('aria-pressed', dir==='new'?'true':'false');
  if(old)old.setAttribute('aria-pressed', dir==='old'?'true':'false');
+ if(window.CareerMotion)window.CareerMotion.revealAssistantGroup();
 }
 const sortNew=document.getElementById('assistant-sort-new');
 if(sortNew)sortNew.addEventListener('click',()=>sortAssistantJobs('new'));
@@ -255,6 +317,7 @@ function appendMsg(role,text){
  wrap.querySelector('.bubble').textContent=text||'';
  log.appendChild(wrap);
  log.scrollTop=log.scrollHeight;
+ if(window.CareerMotion)window.CareerMotion.revealChatMessage(wrap);
  return wrap;
 }
 async function readAssistantEvents(response, onEvent){
@@ -332,10 +395,14 @@ const clearBtn=document.getElementById('assistant-clear');
 if(clearBtn)clearBtn.addEventListener('click',async()=>{
  await fetch('/assistant/clear',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({csrf})});
  const log=document.getElementById('chat-log');
- if(log)log.innerHTML='<p class="muted">对话已清空。</p>';
+ if(log){log.innerHTML='<p class="muted">对话已清空。</p>';if(window.CareerMotion)window.CareerMotion.refresh(log)}
 });
 document.querySelectorAll('button.hint').forEach(btn=>btn.addEventListener('click',()=>{
  const input=document.getElementById('assistant-input');
  if(input){input.value=btn.dataset.hint;input.focus()}
 }));
-</script></body></html>
+</script>
+<script src="{{ url_for('static', filename='vendor/gsap/gsap.min.js') }}" defer></script>
+<script src="{{ url_for('static', filename='vendor/gsap/ScrollTrigger.min.js') }}" defer></script>
+<script src="{{ url_for('static', filename='motion.js') }}" defer></script>
+</body></html>

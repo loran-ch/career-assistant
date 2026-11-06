@@ -1,0 +1,20 @@
+<header class="app-header">
+  <div class="app-header-inner">
+    <a class="app-brand" href="/jobs">
+      <span class="app-brand-mark" aria-hidden="true">CA</span>
+      <strong>智能求职助手</strong>
+    </a>
+    <nav class="app-nav" aria-label="主导航">
+      <a href="/jobs">岗位</a>
+      <a href="/assistant">AI助手</a>
+      <a href="/applications">申请</a>
+      <a href="/profile">我的资料</a>
+      <a href="/settings">设置</a>
+      <span class="account-name" title="当前登录账户">{{ current_user.username }}</span>
+      <form class="logout-form" action="{{ url_for('logout') }}" method="post">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit">退出</button>
+      </form>
+    </nav>
+  </div>
+</header>
