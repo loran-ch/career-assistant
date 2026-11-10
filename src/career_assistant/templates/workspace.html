@@ -30,10 +30,11 @@
 {{ location_select(data.get('location','Hong Kong')) }}
 {% for value,label in [('internship','实习'),('part time','兼职'),('full time','全职')] %}<label><input type="checkbox" name="job_types" value="{{value}}" {% if value in data.get('job_types',[]) %}checked{% endif %}>{{label}}</label>{% endfor %}
 {% for source,label in [('local','本地岗位数据'),('linkedin','linkedin'),('jobsdb','jobsdb'),('indeed','indeed')] %}<label><input type="checkbox" name="sources" value="{{source}}" {% if source=='local' or source in data.get('sources',['local','linkedin']) %}checked{% endif %}>{{label}} · 列表支持 · {{'详情支持' if capabilities[source].details else '详情需手动补全'}} · {{capabilities[source].verification}}</label>{% endfor %}
-<p class="muted">至少选择一种岗位类型和来源。当前本机实测：LinkedIn 列表可用；JobsDB、Indeed 可能返回访问限制。</p>
+<p class="muted">至少选择一种岗位类型和来源。当前本机实测：LinkedIn 列表可用；JobsDB、Indeed 可能返回访问限制。重复点击「开始搜索」会复用正在跑的任务，不会堆积多个搜索。</p>
+{% if auto_search_minutes %}<p class="notice">已开启定时搜索：程序运行期间每 {{auto_search_minutes}} 分钟自动搜一次，结果会自动显示。不需要定时搜索时，改用 <code>web</code>（不加 <code>--schedule</code>）启动即可关闭。</p>{% endif %}
 <button id="search-submit">开始搜索</button></form>
 <h3>搜索结果 <span class="badge">{{ listed_total }}</span></h3>
-{% if task %}<div data-poll="/tasks/{{task.id}}/status"{% if task.status in ['queued','running'] %} data-reload-on="succeeded,failed,uncertain"{% endif %}>{% include 'task_progress.html' %}</div>{% endif %}
+{% if task %}<div data-poll="/tasks/{{task.id}}/status" data-reload-on="succeeded,failed,uncertain" data-reload-from="{{task.status}}">{% include 'task_progress.html' %}</div>{% endif %}
 {% if searching and task.status in ['queued','running'] %}<p class="muted">正在获取岗位；完成后本页会自动刷新并显示结果。</p>{% endif %}
 {% for j in listed %}{{ job_card(j) }}{% else %}
 {% if searching and task.status in ['queued','running'] %}<p class="muted">搜索进行中，暂无结果。</p>
@@ -208,31 +209,33 @@
 <p id="assistant-status" class="muted"></p>
 </section>
 </div>
-{% elif page=='applications' %}<h1>申请</h1><p><a href="/jobs">从已有岗位建立记录，或导入岗位补记外部投递</a></p>{% for a in applications %}<article><a href="/applications/{{a.id}}">{{a.title}} · {{a.company}}</a><p>{{labels.get(a.status,a.status)}}</p></article>{% else %}<p>暂无申请记录。</p>{% endfor %}
+{% elif page=='applications' %}
+<h1>申请</h1><p><a href="/jobs">从已有岗位建立记录，或导入岗位补记外部投递</a></p>
+<section class="board-summary"><h2>总览</h2><p class="board-counts">
+<span>申请 <strong>{{board_summary.applications_total}}</strong></span>
+<span>任务 <strong>{{board_summary.tasks_total}}</strong></span>
+<span>岗位 <strong>{{board_summary.jobs_total}}</strong></span>
+<span>简历 <strong>{{board_summary.resumes}}</strong></span>
+<span>报告 <strong>{{board_summary.reports}}</strong></span>
+<span>分享 <strong>{{board_summary.shares}}</strong></span>
+<span>信息包 <strong>{{board_summary.application_packs}}</strong></span>
+</p><p class="muted">总览只统计数量，不含简历原文与个人信息。</p></section>
+<section><h2>看板</h2><div class="board-columns">
+{% for status in application_status_order %}
+<div class="board-column"><h3>{{labels.get(status,status)}} <span class="badge">{{board_columns.get(status,[])|length}}</span></h3>
+{% for a in board_columns.get(status,[]) %}<article><a href="/applications/{{a.id}}">{{a.title}} · {{a.company}}</a><p class="muted">{{labels.get(a.stage_status or status, a.stage_status or status)}}{% if a.stage_event_date %} · {{a.stage_event_date}}{% endif %}</p></article>{% else %}<p class="muted">暂无</p>{% endfor %}
+</div>
+{% endfor %}
+</div><p class="muted">看板只显示岗位与公司，最新状态取最后一次状态事件。</p></section>
+<section><h2>筛选</h2><form method="get" action="/applications" class="board-filter"><label>状态<select name="status"><option value="">全部</option>{% for status in application_status_order %}<option value="{{status}}" {% if status==filter_status %}selected{% endif %}>{{labels.get(status,status)}}</option>{% endfor %}</select></label><label>关键词<input name="q" value="{{filter_keyword}}" placeholder="职位或公司"></label><button>筛选</button>{% if filter_status or filter_keyword %}<a class="button secondary" href="/applications">清除筛选</a>{% endif %}</form>
+<p class="muted">当前显示 {{application_total}} 条{% if filter_status or filter_keyword %}（全部 {{board_summary.applications_total}} 条）{% endif %}</p>
+{% for a in applications %}<article><a href="/applications/{{a.id}}">{{a.title}} · {{a.company}}</a><p>{{labels.get(a.status,a.status)}}</p></article>{% else %}<p>没有符合条件的申请记录。</p>{% endfor %}
+</section>
 {% elif page=='settings' %}<h1>设置</h1>
 <section><h2>每日岗位邮件汇总</h2><form method="post" action="/settings/digest">{{token()}}<label><input type="checkbox" name="enabled" value="yes" {% if digest.enabled %}checked{% endif %}>启用每日邮件</label><label>每日时间（Asia/Hong_Kong）<input type="time" name="time" value="{{digest.time}}" required></label><button>保存推送设置</button></form>
 <p>调度：{{'运行中' if scheduler_running else '未运行'}} · {{'已启用' if digest.enabled else '已关闭'}}。程序须保持运行；错过时间只补当天一次。</p><p>汇总尚未进入过汇总的本地候选，每岗位自动纳入一次，不触发搜索或 AI。无新候选跳过。预览、失败或不确定的邮件保留原内容，可人工核对后重试。</p>
 {% for t in digest_tasks %}{% set r=t.result or {} %}<article><strong>{{t.payload.day}}</strong><p>{{{'queued':'等待发送','running':'正在处理','succeeded':'处理完成','failed':'失败','uncertain':'结果不确定'}.get(t.status,t.status)}} · {{{'preview':'未发送预览','accepted':'服务器接受，不代表送达','skipped':'无新候选，跳过发送','failed':'发送失败','uncertain':'结果不确定'}.get(r.get('status'), '')}}</p><p>{{r.get('detail') or r.get('error') or t.error}}</p><a href="/settings/digest/{{t.id}}/preview">查看固定汇总内容</a>{% if t.status in ['failed','uncertain'] or r.get('status')=='preview' %}<form method="post" action="/settings/digest/{{t.id}}/retry">{{token()}}<p>结果不确定时先核对收件，重发可能重复。</p><button>重试此邮件</button></form>{% endif %}</article>{% endfor %}</section><section><h2>AI</h2><p>{{'环境变量已配置；此页不检测连接，调用结果在对应分析中显示' if ai_ready else '未配置，分析将显示配置错误；岗位与申请仍可用'}}</p><p>在启动终端配置 RADAR_AI_BASE_URL、RADAR_AI_MODEL、RADAR_AI_API_KEY，重启后生效。密钥不在页面或数据库保存。</p></section><section><h2>邮件</h2><p>{{'SMTP_HOST 已配置；此页不发送测试邮件，发送结果在对应任务中显示' if smtp_ready else '未配置 SMTP，仅生成未发送预览'}}</p><p>环境变量：SMTP_HOST、SMTP_PORT、SMTP_USER、SMTP_PASSWORD、SMTP_FROM、SMTP_TO、SMTP_SSL 或 SMTP_STARTTLS。服务器接受不等于送达。</p></section>{% endif %}
 </main><script>
-document.querySelectorAll('[data-poll]').forEach(el=>{
- let dirty=false;el.addEventListener('input',()=>dirty=true);
- async function refresh(){
-  if(dirty||el.contains(document.activeElement))return;
-  try{
-   let r=await fetch(el.dataset.poll);
-   if(r.ok){
-    let text=await r.text();
-    if(text!==el.innerHTML){
-     el.innerHTML=text;
-     document.dispatchEvent(new CustomEvent('career:motion-refresh',{detail:{element:el}}));
-     const statusEl=el.querySelector('[data-task-status]');
-     if(el.dataset.reloadOn&&statusEl&&el.dataset.reloadOn.split(',').includes(statusEl.dataset.taskStatus)){location.reload();return}
-    }
-   }
-  }catch(e){}
- }
- setInterval(refresh,1500);
-});
 const searchForm=document.getElementById('search-form');
 if(searchForm){searchForm.addEventListener('submit',e=>{
  if(!searchForm.querySelector('input[name="job_types"]:checked')){e.preventDefault();alert('请至少选择一种岗位类型（实习／兼职／全职）。');return}
@@ -402,6 +405,7 @@ document.querySelectorAll('button.hint').forEach(btn=>btn.addEventListener('clic
  if(input){input.value=btn.dataset.hint;input.focus()}
 }));
 </script>
+<script src="{{ url_for('static', filename='poll.js') }}" defer></script>
 <script src="{{ url_for('static', filename='vendor/gsap/gsap.min.js') }}" defer></script>
 <script src="{{ url_for('static', filename='vendor/gsap/ScrollTrigger.min.js') }}" defer></script>
 <script src="{{ url_for('static', filename='motion.js') }}" defer></script>

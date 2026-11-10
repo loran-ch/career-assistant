@@ -12,3 +12,4 @@ Pillow>=10,<13
 deepagents>=0.7
 langchain-openai>=1.0
 confluent-kafka>=2.6,<3
+qrcode>=7.4,<9

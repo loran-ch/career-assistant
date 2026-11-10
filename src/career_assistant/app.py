@@ -45,7 +45,12 @@ from .resume_boundary import (
     with_runtime_integrity,
 )
 from .resume_pdf import file_sha256
+from .api import api as api_blueprint
+from .application_pack import build_pack, create_pack, pack_markdown
+from .share import create_report_share, revoke_share
 from .store import (
+    APPLICATION_LABELS,
+    APPLICATION_STATUS_ORDER,
     APPLICATION_STATUSES,
     Store,
     canonical_output_text,
@@ -55,8 +60,17 @@ from .store import (
 )
 from .service import require, material_markdown, queue_search
 
-LABELS = {"saved": "收藏", "preparing": "准备中", "applied": "已投递", "interview": "面试",
-          "offer": "Offer", "rejected": "拒绝", "withdrawn": "撤回"}
+LABELS = APPLICATION_LABELS
+
+# 只有这两个接口可以在没有登录态的情况下被访问：它们凭一次性令牌换取脱敏摘要。
+PUBLIC_ENDPOINTS = {"api.public_share", "api.share_qr"}
+LOCAL_HOSTS = {"localhost", "127.0.0.1"}
+
+
+def share_allowed_hosts() -> set[str]:
+    """额外允许访问公开分享接口的主机名；默认只有本机可用。"""
+    raw = os.environ.get("CAREER_SHARE_ALLOWED_HOSTS", "")
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
 
 MAX_AVATAR_BYTES = 5 * 1024 * 1024
 AVATAR_MAX_EDGE = 1200
@@ -405,11 +419,13 @@ def create_app(store=None, data_dir=None, testing=False):
     app.config.update(SECRET_KEY=secret_path.read_text().strip(), MAX_CONTENT_LENGTH=11 * 1024 * 1024,
                       SESSION_COOKIE_SAMESITE="Strict", SESSION_COOKIE_HTTPONLY=True,
                       SESSION_COOKIE_NAME="career_assistant_session",
-                      TESTING=testing, UPLOAD_DIR=uploads, BASE_URL="http://127.0.0.1:5000")
+                      TESTING=testing, UPLOAD_DIR=uploads, BASE_URL="http://127.0.0.1:5000",
+                      SHARE_BASE_URL=os.environ.get("CAREER_SHARE_BASE_URL", "").strip())
     app.config["AVATAR_DIR"] = avatars
     store = store or Store(os.environ.get("RADAR_DB_PATH", str(DB_PATH)))
     store.migrate()
     app.extensions["store"] = store
+    app.register_blueprint(api_blueprint)
 
     @app.get("/healthz")
     def healthz():
@@ -417,13 +433,18 @@ def create_app(store=None, data_dir=None, testing=False):
 
     @app.before_request
     def protect_local():
-        if request.host.split(":")[0] not in {"localhost", "127.0.0.1"}:
+        host = request.host.split(":")[0].lower()
+        public = request.endpoint in PUBLIC_ENDPOINTS
+        # 本机以外的地址一律拒绝；只有公开分享接口允许显式放行的主机。
+        if host not in LOCAL_HOSTS and not (public and host in share_allowed_hosts()):
             abort(403)
         if request.endpoint == "healthz":
             return None
+        if public:
+            return None
         if "csrf" not in session:
             session["csrf"] = secrets.token_hex(32)
-        if request.method == "POST":
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
             supplied = request.form.get("csrf") or request.headers.get("X-CSRF") or ""
             if request.is_json:
                 supplied = supplied or str((request.get_json(silent=True) or {}).get("csrf") or "")
@@ -438,7 +459,7 @@ def create_app(store=None, data_dir=None, testing=False):
         if request.endpoint in {"login", "register"}:
             return None
         if g.user is None:
-            if request.path.startswith("/assistant") and request.is_json:
+            if request.path.startswith("/api/") or (request.path.startswith("/assistant") and request.is_json):
                 return jsonify({"ok": False, "error": "登录状态已失效，请重新登录"}), 401
             target = safe_next(request.full_path.rstrip("?"))
             if store.user_count() == 0:
@@ -889,6 +910,18 @@ def create_app(store=None, data_dir=None, testing=False):
             return redirect(url_for("profile", _anchor="profile-avatar"))
         return invalid(ValueError("简历不得超过 10 MB。请替换文件。")) if request.form.get("return_to") else (render_template("page.html", page="error", error="简历不得超过 10 MB。"), 413)
 
+    def active_search_task(preference_id: int) -> dict | None:
+        """正在排队或执行中的搜索任务。
+
+        重复点击「开始搜索」时复用同一个任务，不再堆积新任务：
+        任务堆积会让岗位页一直停在「正在获取岗位」并反复刷新。
+        """
+        for item in store.list("tasks", kind="search"):
+            if item["status"] in {"queued", "running"} and \
+                    (item.get("payload") or {}).get("preference_id") == preference_id:
+                return item
+        return None
+
     def task_redirect(task_id):
         item = require(store, "tasks", task_id)
         if item["kind"] == "search":
@@ -1153,7 +1186,10 @@ def create_app(store=None, data_dir=None, testing=False):
             data = dict(confirmed=True, keywords=keywords, location=location, job_types=types, sources=sources)
             pid = existing[0]["id"] if existing and existing[0]["data"] == data else store.confirm_preferences(None, data)
             if sources:
-                return task_redirect(queue_search(store, pid, f"search:{pid}:{request.form.get('operation') or secrets.token_hex(16)}"))
+                running = active_search_task(pid)
+                if running:
+                    return task_redirect(running["id"])
+                return task_redirect(queue_search(store, pid, f"search:{pid}:{secrets.token_hex(16)}"))
             return redirect(url_for("jobs"))
         return render_template("page.html", page="preferences", preference=existing[0] if existing else None)
 
@@ -1187,16 +1223,25 @@ def create_app(store=None, data_dir=None, testing=False):
             return cards
 
         listed, saved = enrich_cards(listed), enrich_cards(saved)
+        scheduler = app.extensions.get("scheduler")
+        auto_search_minutes = 0
+        if scheduler is not None:
+            monitoring = scheduler.get_job("monitoring")
+            interval = getattr(monitoring.trigger, "interval", None) if monitoring is not None else None
+            auto_search_minutes = int(interval.total_seconds() // 60) if interval is not None else 0
         return render_template("workspace.html", page="jobs", jobs=snapshots, result_jobs=result_jobs,
             listed=listed, listed_page=listed_page, listed_pages=listed_pages, listed_total=listed_total,
             other_jobs=saved, saved_page=saved_page, saved_pages=saved_pages, saved_total=saved_total,
             preferences=store.list("preferences"),
             capabilities=__import__("career_assistant.integrations", fromlist=["SOURCE_CAPABILITIES"]).SOURCE_CAPABILITIES,
-            favorites=favorites, task=task)
+            favorites=favorites, task=task, auto_search_minutes=auto_search_minutes)
 
     @app.post("/search")
     def search():
         preference_id = int(request.form["preference_id"])
+        running = active_search_task(preference_id)
+        if running:
+            return task_redirect(running["id"])
         operation = request.form.get("operation") or uuid.uuid4().hex
         return task_redirect(queue_search(store, preference_id, f"search:{preference_id}:{operation}"))
 
@@ -1215,7 +1260,9 @@ def create_app(store=None, data_dir=None, testing=False):
             db.upsert_job(job)
         finally:
             db.close()
-        canonical = next(j for j in store.list("jobs") if j["url_normalized"] == normal)
+        canonical = store.find_job_by_url(normal)
+        if canonical is None:
+            raise ValueError("岗位保存失败，请重试")
         sid = store.snapshot_job(canonical["job_uid"], jd, bool(jd) and request.form.get("is_full") == "yes",
                            metadata={key: getattr(job, key) for key in ("title", "company", "source", "external_id", "url")})
         return redirect(url_for("job_detail", snapshot_id=sid))
@@ -1331,7 +1378,60 @@ def create_app(store=None, data_dir=None, testing=False):
         snapshot = store.get("job_snapshots", item["course_snapshot_id"]) if item["course_snapshot_id"] else store.get("jobs", item["job_uid"])
         return render_template("page.html", page="application", application=item, snapshot=snapshot,
             versions=store.list("resume_versions"), materials=store.list("materials"),
-            events=store.list("application_events", application_id=application_id))
+            events=store.list("application_events", application_id=application_id),
+            pack=store.latest_application_pack(application_id))
+
+    @app.post("/applications/<int:application_id>/pack")
+    def create_application_pack(application_id):
+        """生成新的投递信息包版本；程序不填写、不上传、不提交任何真实表单。"""
+        require(store, "applications", application_id)
+        result = create_pack(store, application_id)
+        flash(f"已生成投递信息包版本 #{result['version']}；请自行前往招聘网站填写与提交。")
+        return redirect(url_for("application", application_id=application_id))
+
+    @app.get("/applications/<int:application_id>/pack/export")
+    def export_application_pack(application_id):
+        """导出投递信息包 Markdown；没有已保存版本时按当前依据生成一份预览。"""
+        require(store, "applications", application_id)
+        record = store.latest_application_pack(application_id)
+        pack = record["data"] if record else build_pack(store, application_id)
+        response = Response(pack_markdown(pack), mimetype="text/markdown; charset=utf-8")
+        response.headers["Content-Disposition"] = (
+            f'attachment; filename="application-pack-{application_id}.md"')
+        return response
+
+    def share_base_url() -> str:
+        """分享链接基准地址：优先 CAREER_SHARE_BASE_URL，其次当前请求来源。"""
+        configured = str(app.config.get("SHARE_BASE_URL") or "").strip()
+        return configured.rstrip("/") if configured else str(request.host_url or "").rstrip("/")
+
+    @app.post("/reports/<int:report_id>/share")
+    def share_report(report_id):
+        """为报告生成分享链接。
+
+        链接明文与二维码只出现在**这一次响应**里：不写进 URL、不进 session、不进日志。
+        数据库只保存 sha256 摘要与前 8 位提示，所以离开本页后无法再找回明文。
+        """
+        require(store, "reports", report_id)
+        base = share_base_url()
+        result = create_report_share(store, report_id, base)
+        result["local_only"] = (urlsplit(base).hostname or "") in {"localhost", "127.0.0.1", "::1"}
+        report = store.get("reports", report_id)
+        return render_template("page.html", page="share", share=result,
+                               resume_id=report["resume_id"])
+
+    @app.post("/shares/revoke")
+    def revoke_share_link():
+        """撤销一条分享链接；令牌明文只在表单里出现一次。"""
+        token = str(request.form.get("token") or "").strip()
+        if not token:
+            raise ValueError("缺少分享令牌")
+        if not revoke_share(store, token):
+            raise ValueError("分享链接不存在或已撤销")
+        flash("分享链接已撤销，对方再打开会看到「分享链接已被撤销」。")
+        resume_id = int(request.form.get("resume_id") or 0)
+        target = url_for("resume", resume_id=resume_id) if resume_id else url_for("applications")
+        return redirect(target)
 
     @app.post("/jobs/<int:snapshot_id>/favorite")
     def toggle_favorite(snapshot_id):
@@ -1396,13 +1496,31 @@ def create_app(store=None, data_dir=None, testing=False):
         if kind not in {"report", "match"}:
             abort(404)
         require(store, "reports" if kind == "report" else "matches", record_id)
-        return task_redirect(store.enqueue("email", {"type": kind, "id": record_id},
-                    f"email:{kind}:{record_id}", max_attempts=2, side_effect=True))
+        payload = {"type": kind, "id": record_id}
+        # 幂等键原本写死成 email:{kind}:{id}，会把页面钉死在**第一次**那条任务上：
+        # 第一次没配 SMTP 时留下的是「仅预览」，之后即使配好了再点也只会回到旧任务，
+        # 用户看到的永远是「未发送，仅预览」，像是没走邮箱配置。
+        # 现在按「这份内容最近一次邮件任务」的状态决定复用还是新建。
+        previous = next((t for t in store.list("tasks", kind="email")
+                         if (t.get("payload") or {}) == payload), None)
+        if previous is not None:
+            if previous["status"] in {"queued", "running"}:
+                return task_redirect(previous["id"])      # 连点：复用正在跑的那条
+            if store.list("email_attempts", task_id=previous["id"], status="accepted"):
+                flash("这份内容此前已发送成功（服务器已接受），不会重复发送。")
+                return task_redirect(previous["id"])
+        # 新任务的幂等键带上上一条任务 id，保证每次点击都是新的一条、且不会撞键。
+        key = f"email:{kind}:{record_id}" if previous is None \
+            else f"email:{kind}:{record_id}:{previous['id']}"
+        return task_redirect(store.enqueue("email", payload, key,
+                                           max_attempts=2, side_effect=True))
 
     @app.get("/tasks/<int:task_id>")
     def task(task_id):
         item = require(store, "tasks", task_id)
-        return render_template("page.html", page="task", task=item, attempts=store.list("email_attempts", task_id=task_id))
+        facts = store.list("resume_versions", resume_id=item["payload"]["resume_id"]) if item["kind"] == "analyze" else []
+        return render_template("page.html", page="task", task=item, attempts=store.list("email_attempts", task_id=task_id),
+                              facts_available=bool(facts))
 
     @app.post("/tasks/<int:task_id>/retry")
     def retry(task_id):
@@ -1534,7 +1652,22 @@ def create_app(store=None, data_dir=None, testing=False):
 
     @app.get("/applications")
     def applications():
-        return render_template("workspace.html", page="applications", applications=store.list("applications"))
+        """申请管理：看板视图 + 状态／关键词筛选；筛选结果仍可进入详情。"""
+        status = str(request.args.get("status") or "").strip()
+        keyword = str(request.args.get("q") or "").strip()[:80]
+        if status and status not in APPLICATION_STATUSES:
+            raise ValueError("未知申请状态")
+        rows, total = store.query_applications(status=status, keyword=keyword,
+                                               limit=100, offset=0)
+        columns: dict[str, list[dict]] = {key: [] for key in APPLICATION_STATUS_ORDER}
+        for row in store.query_application_board():
+            key = row["status"] if row["status"] in columns else "saved"
+            columns[key].append(row)
+        return render_template("workspace.html", page="applications", applications=rows,
+                               application_total=total, board_columns=columns,
+                               board_summary=store.board_summary(),
+                               application_status_order=APPLICATION_STATUS_ORDER,
+                               filter_status=status, filter_keyword=keyword)
 
     @app.post('/settings/digest')
     def save_digest():
@@ -1555,7 +1688,14 @@ def create_app(store=None, data_dir=None, testing=False):
         task = require(store, 'tasks', task_id)
         if task['kind'] != 'email' or task['payload'].get('type') != 'digest':
             abort(404)
-        return '<h1>汇总内容预览，不代表已发送</h1>' + task['payload']['html']
+        # 正文由 digest 生成时已逐段转义，这里补上文档声明避免中文乱码。
+        body = task['payload'].get('html') or ''
+        return Response(
+            '<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">'
+            '<title>汇总内容预览</title></head><body>'
+            '<h1>汇总内容预览，不代表已发送</h1>' + body + '</body></html>',
+            mimetype="text/html; charset=utf-8",
+        )
 
     @app.get("/settings")
     def settings():

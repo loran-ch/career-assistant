@@ -19,7 +19,7 @@ from .resume_boundary import BoundaryEvaluation, RefusalLevel, evaluation_from_a
 from .resume_document import validate_delivery_profile
 
 UPSTREAM_COMMIT = "e2bcb2ba917644b8a88d9981d4e3eb514be98c65"
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 TABLES = {
     name: f"course_{name}" for name in (
         "resumes", "resume_versions", "reports", "preferences", "job_snapshots",
@@ -27,11 +27,19 @@ TABLES = {
         "favorites", "tailored_resumes", "profile_versions", "resume_delivery_profiles",
         "output_approvals",
         "task_outbox",
+        "share_tokens",
+        "application_packs",
     )
 }
 TABLES["applications"] = "applications"
 TABLES["jobs"] = "jobs"
-APPLICATION_STATUSES = {"saved", "preparing", "applied", "interview", "offer", "rejected", "withdrawn"}
+# 看板与申请筛选共用同一组状态，顺序即看板从左到右的列顺序。
+APPLICATION_STATUS_ORDER = ("saved", "preparing", "applied", "interview", "offer",
+                             "rejected", "withdrawn")
+APPLICATION_STATUSES = set(APPLICATION_STATUS_ORDER)
+APPLICATION_LABELS = {"saved": "收藏", "preparing": "准备中", "applied": "已投递",
+                      "interview": "面试", "offer": "Offer", "rejected": "拒绝",
+                      "withdrawn": "撤回"}
 
 SCHEMA = """
 CREATE TABLE course_resumes (
@@ -349,12 +357,12 @@ class Store:
             with self.connect() as c:
                 exists = c.execute("SELECT 1 FROM sqlite_master WHERE name='course_migrations'").fetchone()
                 if exists and (c.execute("SELECT MAX(version) FROM course_migrations").fetchone()[0] or 0) >= SCHEMA_VERSION:
-                    return self._migrate_v13()
+                    return self._migrate_v14()
         from .worker import FileLock
         lock = FileLock(Path(f"{self.path}.worker.lock"))
         lock.acquire()
         try:
-            return self._migrate_v13()
+            return self._migrate_v14()
         finally:
             lock.release()
 
@@ -884,6 +892,73 @@ class Store:
             c.execute("INSERT INTO course_migrations VALUES(?,?,?)", (13, stamp(), UPSTREAM_COMMIT))
             if c.execute("PRAGMA foreign_key_check").fetchall():
                 raise RuntimeError("v13 迁移外键校验失败")
+        return first or backup
+
+    def _migrate_v14(self) -> str | None:
+        """Add the share-token ledger and the local application-pack versions."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as c:
+            exists = c.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='course_migrations'"
+            ).fetchone()
+            current = (
+                c.execute("SELECT MAX(version) FROM course_migrations").fetchone()[0]
+                if exists else 0
+            )
+        if current and current > 14:
+            raise RuntimeError("数据库版本比本程序新")
+        if current == 14:
+            return None
+        first = self._migrate_v13() if current != 13 else None
+        backup = str(self.path.with_name(
+            f"{self.path.name}.before-course-v14-{uuid.uuid4().hex[:12]}.bak"
+        )) if current == 13 else None
+        with self.connect() as c:
+            if backup:
+                with closing(sqlite3.connect(backup)) as destination:
+                    c.backup(destination)
+                    if destination.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise RuntimeError("v14 备份校验失败")
+            c.execute("BEGIN IMMEDIATE")
+            if c.execute("SELECT 1 FROM course_migrations WHERE version=14").fetchone():
+                return first or backup
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS course_share_tokens ("
+                "id INTEGER PRIMARY KEY, "
+                "token_hash TEXT NOT NULL UNIQUE, "
+                "token_hint TEXT NOT NULL, "
+                "scope TEXT NOT NULL, "
+                "subject_type TEXT NOT NULL, "
+                "subject_id INTEGER, "
+                "base_url TEXT NOT NULL DEFAULT '', "
+                "summary_json TEXT NOT NULL DEFAULT '{}', "
+                "created_at TEXT NOT NULL, "
+                "expires_at TEXT, "
+                "revoked_at TEXT, "
+                "access_count INTEGER NOT NULL DEFAULT 0, "
+                "last_accessed_at TEXT)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS course_share_tokens_active "
+                "ON course_share_tokens(scope,revoked_at,expires_at)"
+            )
+            # 本地投递信息包：不可变版本，保存新版本不覆盖历史。
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS course_application_packs ("
+                "id INTEGER PRIMARY KEY, "
+                "application_id INTEGER NOT NULL REFERENCES applications(id), "
+                "version INTEGER NOT NULL, "
+                "data_json TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "UNIQUE(application_id,version))"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS course_application_packs_recent "
+                "ON course_application_packs(application_id,version)"
+            )
+            c.execute("INSERT INTO course_migrations VALUES(?,?,?)", (14, stamp(), UPSTREAM_COMMIT))
+            if c.execute("PRAGMA foreign_key_check").fetchall():
+                raise RuntimeError("v14 迁移外键校验失败")
         return first or backup
 
     def cleanup_job_cache(self, *, now=None) -> int:
@@ -1998,3 +2073,221 @@ class Store:
                           (version_id,material_id,snapshot_id,stamp(),application_id))
             self._insert_on(c, 'application_events', dict(application_id=application_id,status=app['status'],note=note,
                 created_at=stamp(),basis_json=encode(basis)))
+
+    def find_job_by_url(self, url_normalized: str) -> dict | None:
+        """按归一化链接定位一条岗位；写入后回查用，避免依赖列表顺序。"""
+        if not url_normalized:
+            return None
+        with self.connect() as conn:
+            return decode(conn.execute(
+                "SELECT * FROM jobs WHERE url_normalized=?", (url_normalized,)
+            ).fetchone())
+
+    def query_applications(self, *, status: str = "", keyword: str = "",
+                           date_from: str = "", date_to: str = "",
+                           limit: int = 20, offset: int = 0) -> tuple[list[dict], int]:
+        """申请筛选：状态、关键词与日期区间，返回本页记录与总数。"""
+        where, params = [], []
+        if status:
+            where.append("status=?")
+            params.append(status)
+        if keyword:
+            where.append("(title LIKE ? OR company LIKE ?)")
+            params.extend([f"%{keyword}%", f"%{keyword}%"])
+        day = "date(COALESCE(NULLIF(applied_date,''), substr(created_at,1,10)))"
+        if date_from:
+            where.append(f"{day} >= date(?)")
+            params.append(date_from)
+        if date_to:
+            where.append(f"{day} <= date(?)")
+            params.append(date_to)
+        clause = " AND ".join(where) or "1"
+        with self.connect() as conn:
+            total = int(conn.execute(
+                f"SELECT COUNT(*) FROM applications WHERE {clause}", tuple(params)
+            ).fetchone()[0])
+            rows = conn.execute(
+                f"SELECT * FROM applications WHERE {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        return [decode(row) for row in rows], total
+
+    def query_tasks(self, *, kind: str = "", status: str = "",
+                    limit: int = 20, offset: int = 0) -> tuple[list[dict], int]:
+        """任务列表只返回状态字段，不返回载荷，避免带出简历内容。"""
+        where, params = [], []
+        if kind:
+            where.append("kind=?")
+            params.append(kind)
+        if status:
+            where.append("status=?")
+            params.append(status)
+        clause = " AND ".join(where) or "1"
+        with self.connect() as conn:
+            total = int(conn.execute(
+                f"SELECT COUNT(*) FROM course_tasks WHERE {clause}", tuple(params)
+            ).fetchone()[0])
+            rows = conn.execute(
+                "SELECT id,kind,status,attempts,max_attempts,side_effect,owner,error,"
+                "available_at,started_at,finished_at,created_at,updated_at "
+                f"FROM course_tasks WHERE {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        return [dict(row) for row in rows], total
+
+    def query_jobs(self, *, keyword: str = "", source: str = "",
+                   limit: int = 20, offset: int = 0) -> tuple[list[dict], int]:
+        """岗位列表：按关键词与来源筛选。"""
+        where, params = [], []
+        if keyword:
+            where.append("(title LIKE ? OR company LIKE ?)")
+            params.extend([f"%{keyword}%", f"%{keyword}%"])
+        if source:
+            where.append("source=?")
+            params.append(source)
+        clause = " AND ".join(where) or "1"
+        with self.connect() as conn:
+            total = int(conn.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE {clause}", tuple(params)
+            ).fetchone()[0])
+            rows = conn.execute(
+                "SELECT job_uid,source,external_id,title,company,url,location,salary_text,"
+                "status,first_seen_at,last_fetched_at,llm_score FROM jobs "
+                f"WHERE {clause} ORDER BY first_seen_at DESC, job_uid DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        return [dict(row) for row in rows], total
+
+    def query_application_board(self) -> list[dict]:
+        """看板数据：每条申请一行，附带最后一次状态事件。"""
+        with self.connect() as conn:
+            rows = conn.execute("""
+                SELECT a.id, a.title, a.company, a.status, a.applied_date,
+                       a.created_at, a.updated_at,
+                       e.status AS stage_status, e.event_date AS stage_event_date,
+                       e.created_at AS stage_changed_at
+                FROM applications a
+                LEFT JOIN course_application_events e ON e.id = (
+                    SELECT x.id FROM course_application_events x
+                    WHERE x.application_id = a.id ORDER BY x.id DESC LIMIT 1)
+                ORDER BY a.id DESC
+            """).fetchall()
+        return [dict(row) for row in rows]
+
+    def board_summary(self) -> dict:
+        """看板汇总：只输出计数，不含任何个人材料。"""
+        today = now_hk().date().isoformat()
+        with self.connect() as conn:
+            applications = {
+                row[0]: int(row[1]) for row in conn.execute(
+                    "SELECT status, COUNT(*) FROM applications GROUP BY status")
+            }
+            tasks = {
+                row[0]: int(row[1]) for row in conn.execute(
+                    "SELECT status, COUNT(*) FROM course_tasks GROUP BY status")
+            }
+            jobs_total = int(conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
+            jobs_today = int(conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE substr(first_seen_at,1,10)=?", (today,)
+            ).fetchone()[0])
+            counts = {}
+            for key, table in (
+                ("resumes", "course_resumes"),
+                ("reports", "course_reports"),
+                ("snapshots", "course_job_snapshots"),
+                ("materials", "course_materials"),
+                ("favorites", "course_favorites"),
+                ("tailored_resumes", "course_tailored_resumes"),
+                ("shares", "course_share_tokens"),
+                ("application_packs", "course_application_packs"),
+            ):
+                counts[key] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        return {
+            "applications_total": sum(applications.values()),
+            "applications_by_status": applications,
+            "tasks_total": sum(tasks.values()),
+            "tasks_by_status": tasks,
+            "jobs_total": jobs_total,
+            "jobs_today": jobs_today,
+            **counts,
+        }
+
+    def create_share_token(self, token_hash: str, token_hint: str, scope: str,
+                           subject_type: str, subject_id: int | None,
+                           summary: dict, expires_at: str | None, base_url: str = "") -> int:
+        """登记一条分享令牌；只持久化摘要与站点根地址，明文令牌不落库。"""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM course_share_tokens WHERE token_hash=?", (token_hash,)
+            ).fetchone():
+                raise ValueError("分享令牌冲突，请重新生成")
+            return self._insert_on(conn, "share_tokens", dict(
+                token_hash=token_hash, token_hint=token_hint, scope=scope,
+                subject_type=subject_type, subject_id=subject_id,
+                base_url=str(base_url or "").rstrip("/"),
+                summary_json=encode(summary or {}), created_at=stamp(),
+                expires_at=expires_at, revoked_at=None, access_count=0,
+                last_accessed_at=None,
+            ))
+
+    def get_share_token(self, token_hash: str) -> dict | None:
+        with self.connect() as conn:
+            return decode(conn.execute(
+                "SELECT * FROM course_share_tokens WHERE token_hash=?", (token_hash,)
+            ).fetchone())
+
+    def list_share_tokens(self, *, include_revoked: bool = True) -> list[dict]:
+        with self.connect() as conn:
+            sql = "SELECT * FROM course_share_tokens"
+            if not include_revoked:
+                sql += " WHERE revoked_at IS NULL"
+            sql += " ORDER BY id DESC"
+            rows = conn.execute(sql).fetchall()
+        return [decode(row) for row in rows]
+
+    def revoke_share_token(self, token_hash: str) -> bool:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE course_share_tokens SET revoked_at=? "
+                "WHERE token_hash=? AND revoked_at IS NULL",
+                (stamp(), token_hash),
+            )
+            return bool(cursor.rowcount)
+
+    def touch_share_token(self, token_hash: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE course_share_tokens SET access_count=access_count+1,last_accessed_at=? "
+                "WHERE token_hash=?",
+                (stamp(), token_hash),
+            )
+
+    def save_application_pack(self, application_id: int, data: dict) -> int:
+        """保存一个不可变的投递信息包版本，历史版本不覆盖。"""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            version = conn.execute(
+                "SELECT COALESCE(MAX(version),0)+1 FROM course_application_packs WHERE application_id=?",
+                (int(application_id),),
+            ).fetchone()[0]
+            return self._insert_on(conn, "application_packs", dict(
+                application_id=int(application_id), version=version,
+                data_json=encode(data), created_at=stamp(),
+            ))
+
+    def latest_application_pack(self, application_id: int) -> dict | None:
+        with self.connect() as conn:
+            return decode(conn.execute(
+                "SELECT * FROM course_application_packs WHERE application_id=? "
+                "ORDER BY version DESC LIMIT 1", (int(application_id),),
+            ).fetchone())
+
+    def list_application_packs(self, application_id: int) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM course_application_packs WHERE application_id=? ORDER BY version DESC",
+                (int(application_id),),
+            ).fetchall()
+        return [decode(row) for row in rows]

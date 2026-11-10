@@ -123,9 +123,9 @@ def handlers(store: Store, upload_dir: Path, base_url: str, ai=None):
                 try:
                     for job in jobs:
                         db.upsert_job(job)
-                        canonical = store.get("jobs", job.job_uid)
+                        canonical = store.get("jobs", job.job_uid) or store.find_job_by_url(job.url_normalized)
                         if not canonical:
-                            canonical = next(j for j in store.list("jobs") if j["url_normalized"] == job.url_normalized)
+                            raise ValueError(f"岗位写入后无法回查：{job.url_normalized}")
                         snapshots.append(store.snapshot_job(canonical["job_uid"], job.description_snippet, is_full=False, fetched=True,
                             metadata={key: getattr(job, key) for key in ("title", "company", "source", "external_id", "url")}))
                 finally:

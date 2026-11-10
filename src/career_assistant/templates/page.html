@@ -69,7 +69,7 @@
 <section id="profile-resumes" class="profile-section profile-panel" data-profile-panel="resumes" hidden>
 <div class="profile-section-head"><div><h2>简历文件</h2><p>上传文本 PDF 后自动分析，并把可验证的技能、经历、证书和补充资料合并进职业资料库。</p></div><span class="badge">{{resumes|length}} 份</span></div>
 {% if resumes %}<div class="resume-list">{% for r in resumes %}<div class="resume-row"><div class="resume-info"><a href="/resumes/{{r.id}}">{{r.filename}}</a><small>简历 #{{r.id}}</small></div>{% if selected_resume==r.id %}<span class="badge resume-current">当前使用</span>{% else %}<form action="/resumes/{{r.id}}/select" method="post">{{token()}}<button class="button secondary">使用这份</button></form>{% endif %}</div>{% endfor %}</div>{% else %}<p class="empty-state">还没有简历。上传文本 PDF 后即可用于岗位分析和材料生成。</p>{% endif %}
-{% if upload_task %}{% set task=upload_task %}{% set facts_available=upload_facts_available %}<div class="resume-import-status" data-poll="/tasks/{{upload_task.id}}/status" data-reload-on="profile-import">{% include 'task_progress.html' with context %}</div>{% endif %}
+{% if upload_task %}{% set task=upload_task %}{% set facts_available=upload_facts_available %}<div class="resume-import-status" data-poll="/tasks/{{upload_task.id}}/status" data-reload-on="succeeded,failed,uncertain" data-reload-from="{{upload_task.status}}">{% include 'task_progress.html' with context %}</div>{% endif %}
 <details class="add-item"><summary>上传新简历</summary><form action="/resumes" method="post" enctype="multipart/form-data">{{token(url_for('profile', _anchor='profile-resumes'))}}<label>PDF 文件<input type="file" name="resume" accept="application/pdf" required></label><input type="hidden" name="import_profile" value="no"><label class="checkbox-row"><input type="checkbox" name="import_profile" value="yes" checked> 自动补充职业资料库</label><p class="muted">最大 10 MB。AI 只导入能追溯到简历原文的条目，并自动跳过现有资料中的重复项；导入结果仍可在下方各分类中编辑。</p><div class="form-actions"><button>上传、分析并补充资料</button></div></form></details>
 {% if tasks %}<details class="resume-history"><summary>最近处理记录</summary><div class="resume-history-list">{% for t in tasks %}<div><a href="/tasks/{{t.id}}">{{t.created_at}}</a><span>{{t.kind}}</span><small>{{states.get(t.status,t.status)}}</small></div>{% endfor %}</div></details>{% endif %}
 </section>
@@ -190,12 +190,39 @@
 })();
 </script>
 {% elif page=='resume' %}
-{% if mail_task %}<section data-poll="/tasks/{{mail_task.id}}/status"></section>{% endif %}
+{% if mail_task %}<section data-poll="/tasks/{{mail_task.id}}/status" data-reload-on="succeeded,failed,uncertain" data-reload-from="{{mail_task.status}}">{% with task=mail_task %}{% include 'task_progress.html' with context %}{% endwith %}</section>{% endif %}
 <h1>{{resume.filename}}</h1><a href="/resumes/{{resume.id}}/pdf">下载原始 PDF</a><p class="notice">事实编辑不会改写 PDF。自动事实经程序校验后可用，不等于人工确认；如有矛盾请对照原文纠正相关条目。</p>
 <details><summary>原始提取文本</summary><pre>{{resume.text}}</pre></details>
 <form action="/resumes/{{resume.id}}/confirm" method="post"><section>{{token()}}<label>编辑事实（每行一项，新增内容视为用户提供）<textarea name="facts" rows="12" required>{{fact_lines}}</textarea></label><button>保存事实新版本</button></section></form>
 {% for v in versions %}<details><summary>事实版本 #{{v.id}} · {{states.get(v.origin,v.origin)}} · {{v.confirmed_at}}</summary>{% for f in v.facts.facts %}<p>{{f.text}} <small>来源：{{states.get(f.get('origin',v.origin),f.get('origin',v.origin))}}</small><br><small>依据：{{f.evidence}}</small></p>{% endfor %}</details>{% endfor %}
-{% for r in reports %}{% set audit_items=r.data.audit_items|default([]) %}{% set pass_count=audit_items|selectattr('status','equalto','pass')|list|length %}{% set issue_count=audit_items|selectattr('status','equalto','issue')|list|length %}<section class="audit-report"><header class="audit-report-head"><div><span class="item-kicker">AI审计</span><h2>AI审计 #{{r.id}}</h2></div><time datetime="{{r.data.analysis_date}}">审计日期（香港）<strong>{{r.data.analysis_date}}</strong></time></header><p class="audit-overview">{{r.data.summary}}</p><div class="audit-counts" aria-label="审计结果统计"><span class="audit-count audit-count-pass"><strong>{{pass_count}}</strong> 项通过</span><span class="audit-count audit-count-issue"><strong>{{issue_count}}</strong> 项需处理</span></div>{% if audit_items %}<div class="audit-list">{% for item in audit_items %}<article class="audit-item audit-{{item.status}}"><div class="audit-item-head"><span class="audit-status">{{'通过' if item.status=='pass' else '需处理'}}</span><span class="audit-category">{{item.category}}</span><h3>{{item.title}}</h3></div><p>{{item.summary}}</p>{% if item.recommendation %}<div class="audit-recommendation"><strong>{{'处理建议' if item.status=='issue' else '说明'}}</strong><span>{{item.recommendation}}</span></div>{% endif %}{% if item.evidence %}<details class="audit-evidence"><summary>查看原文依据</summary><blockquote>{{item.evidence}}</blockquote></details>{% endif %}</article>{% endfor %}</div>{% else %}<p class="empty-state">这份历史报告没有可逐项展示的审计结果。</p>{% endif %}{% if r.data.review_history|default([])|length > 1 %}<details><summary>审阅与修正记录</summary>{{review_history(r.data.review_history)}}</details>{% endif %}<form action="/email/report/{{r.id}}" method="post">{{token()}}<button>推送审计／未发送预览</button></form></section>{% else %}<p>AI审计尚未生成。已有事实仍可使用，错误见首页任务。</p>{% endfor %}
+{% for r in reports %}{% set audit_items=r.data.audit_items|default([]) %}{% set pass_count=audit_items|selectattr('status','equalto','pass')|list|length %}{% set issue_count=audit_items|selectattr('status','equalto','issue')|list|length %}<section class="audit-report"><header class="audit-report-head"><div><span class="item-kicker">AI审计</span><h2>AI审计 #{{r.id}}</h2></div><time datetime="{{r.data.analysis_date}}">审计日期（香港）<strong>{{r.data.analysis_date}}</strong></time></header><p class="audit-overview">{{r.data.summary}}</p><div class="audit-counts" aria-label="审计结果统计"><span class="audit-count audit-count-pass"><strong>{{pass_count}}</strong> 项通过</span><span class="audit-count audit-count-issue"><strong>{{issue_count}}</strong> 项需处理</span></div>{% if audit_items %}<div class="audit-list">{% for item in audit_items %}<article class="audit-item audit-{{item.status}}"><div class="audit-item-head"><span class="audit-status">{{'通过' if item.status=='pass' else '需处理'}}</span><span class="audit-category">{{item.category}}</span><h3>{{item.title}}</h3></div><p>{{item.summary}}</p>{% if item.recommendation %}<div class="audit-recommendation"><strong>{{'处理建议' if item.status=='issue' else '说明'}}</strong><span>{{item.recommendation}}</span></div>{% endif %}{% if item.evidence %}<details class="audit-evidence"><summary>查看原文依据</summary><blockquote>{{item.evidence}}</blockquote></details>{% endif %}</article>{% endfor %}</div>{% else %}<p class="empty-state">这份历史报告没有可逐项展示的审计结果。</p>{% endif %}{% if r.data.review_history|default([])|length > 1 %}<details><summary>审阅与修正记录</summary>{{review_history(r.data.review_history)}}</details>{% endif %}<form action="/email/report/{{r.id}}" method="post">{{token()}}<button>推送审计／未发送预览</button></form><form action="/reports/{{r.id}}/share" method="post">{{token()}}<button class="button secondary">生成分享链接</button></form></section>{% else %}<p>AI审计尚未生成。已有事实仍可使用，错误见首页任务。</p>{% endfor %}
+{% elif page=='share' %}
+<h1>分享链接已生成</h1><p class="notice">链接与二维码<strong>只显示这一次</strong>。离开本页后无法再找回明文（数据库里只存摘要），请立即保存。</p>
+<section><h2>分享链接</h2><p><code id="share-url">{{share.url}}</code></p><p><button type="button" id="copy-share-url" data-url="{{share.url}}">复制链接</button></p><p class="muted">有效期至 {{share.expires_at[:16].replace('T',' ')}}（{{share.ttl_days}} 天）· 对方每打开一次计数一次</p>{% if share.local_only %}<p class="notice">当前是本机地址（127.0.0.1），<strong>手机扫码打不开</strong>。要在手机上打开：设置环境变量 <code>CAREER_SHARE_BASE_URL=http://&lt;本机局域网IP&gt;:5000</code> 与 <code>CAREER_SHARE_ALLOWED_HOSTS=&lt;本机局域网IP&gt;</code>，重启程序后重新生成分享链接。</p>{% endif %}</section>
+<section><h2>二维码</h2>{% if share.qr.available %}<p><img src="{{share.qr.data_uri}}" alt="分享链接二维码" width="220" height="220"></p><p class="muted">手机相机扫一扫即可打开；二维码内容与上方链接完全一致。</p>{% else %}<p class="notice">二维码组件未安装，请先执行 <code>pip install qrcode</code>；或直接复制上面的链接。</p>{% endif %}</section>
+<section><h2>对方能看到什么</h2><ul><li>事实总数 {{share.summary.facts_total}}</li><li>技能数 {{share.summary.skills_total}}</li><li>经历／项目数 {{share.summary.experiences_total}}</li><li>审计项 {{share.summary.audit_total}}（通过 {{share.summary.audit_pass}}／需处理 {{share.summary.audit_issue}}）</li><li>审计覆盖率 {{share.summary.coverage_percent}}%</li></ul><p class="muted">只有计数与分类，<strong>不含</strong>姓名、联系方式、简历原文与 AI 结论文本。</p></section>
+<section><h2>不想给了？</h2><form action="/shares/revoke" method="post">{{token()}}<input type="hidden" name="token" value="{{share.token}}"><input type="hidden" name="resume_id" value="{{resume_id}}"><button class="danger">撤销这条分享链接</button></form><p class="muted">撤销后对方再打开会看到「分享链接已被撤销」。</p></section>
+<p><a href="/resumes/{{resume_id}}">返回简历详情</a> · <a href="/applications">打开申请看板</a></p>
+<script>
+(() => {
+  const btn = document.getElementById('copy-share-url');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(btn.dataset.url);
+      btn.textContent = '已复制';
+    } catch (e) {
+      const code = document.getElementById('share-url');
+      const range = document.createRange();
+      range.selectNodeContents(code);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      btn.textContent = '请手动复制';
+    }
+  });
+})();
+</script>
 {% elif page=='preferences' %}
 <h1>求职偏好</h1><p>点击开始搜索即保存。偏好独立于简历，修改另存版本，不改变历史匹配。</p>{% set data=preference.data if preference else {} %}
 <form method="post"><section>{{token()}}<label>目标职位（每行一个，最多 7 个）<textarea name="keywords" required>{{data.get('keywords',[])|join('\n')}}</textarea></label>{{ location_select(data.get('location','Hong Kong')) }}
@@ -210,7 +237,6 @@
 <form action="/jobs/{{j.id}}/application" method="post">{{token()}}<label>申请状态<select name="status">{% for key,label in labels.items() %}<option value="{{key}}">{{label}}</option>{% endfor %}</select></label><label>备注／自有材料说明<textarea name="note"></textarea></label><button>保存申请记录</button></form></article>{% else %}<p>暂无岗位，可搜索或手动录入；不需要先生成报告。</p>{% endfor %}
 {% elif page=='preparation' %}
 <h1>{{snapshot.title}} · 准备 #{{preparation.id}}</h1><p>当前步骤：<strong>{{states.get(preparation.state,preparation.state)}}</strong></p><p>事实版本 #{{preparation.resume_version_id}} · 偏好 #{{preparation.preference_id}} · 岗位依据 #{{preparation.snapshot_id}}</p><p class="notice">{{preparation.error}}</p><a href="">刷新实际进度</a>
-{% if preparation.state in ['queued','fetching_jd','matching','materials'] %}<script>setTimeout(()=>location.reload(),3000)</script>{% endif %}
 {% if preparation.state=='waiting_facts' %}<form method="post">{{token()}}{{resume_select(resumes,preparation.resume_id)}}{{preference_select(preferences)}}<p><a href="/profile">上传或编辑简历事实</a> · <a href="/preferences">设置偏好</a></p><button>使用所选资料继续</button></form>
 {% elif preparation.state=='waiting_jd' %}<form method="post">{{token()}}<p><a href="{{snapshot.url}}" target="_blank" rel="noopener">打开岗位原文</a></p><label>粘贴完整 JD<textarea name="jd" required rows="12"></textarea></label><button>保存 JD 并继续</button></form>
 {% elif preparation.state in ['failed','problem_draft'] %}<form method="post">{{token()}}<button>从失败步骤重新生成</button></form>{% endif %}
@@ -233,9 +259,21 @@
 <form method="post"><section>{{token()}}<label>日期<input type="date" name="event_date"></label><label>申请状态<select name="status">{% for key,label in labels.items() %}<option value="{{key}}" {% if key==application.status %}selected{% endif %}>{{label}}</option>{% endfor %}</select></label><label>备注<textarea name="note"></textarea></label><button>保存状态</button></section></form>
 <section><h2>申请资料</h2><p>准备与实际使用分别保存；记录已投递不会自动把准备材料标为实际使用。下方保存会更新所选用途并记录历史。</p><form action="/applications/{{application.id}}/basis" method="post">{{token()}}<label>用途<select name="usage"><option value="planned">准备使用</option><option value="actual" {% if application.applied_date %}selected{% endif %}>实际使用</option></select></label><details><summary>准备使用与实际使用的版本</summary><p>准备使用：事实 {{application.course_planned.get("resume_version_id") or "未关联"}} · 材料 {{application.course_planned.get("material_id") or "未关联"}}</p><p>实际使用：事实 {{application.course_actual.get("resume_version_id") or "未关联"}} · 材料 {{application.course_actual.get("material_id") or "未关联"}}</p></details><label>事实版本<select name="resume_version_id"><option value="">未指定／由材料决定</option>{% for v in versions %}<option value="{{v.id}}" {% if v.id==application.course_resume_version_id %}selected{% endif %}>简历 #{{v.resume_id}} · 事实 #{{v.id}}</option>{% endfor %}</select></label><label>材料版本<select name="material_id"><option value="">使用自己的材料／暂不关联</option>{% for m in materials %}<option value="{{m.id}}" {% if m.id==application.course_material_id %}selected{% endif %}>材料 #{{m.id}} · {{states.get(m.data.get('status'),'历史')}}</option>{% endfor %}</select></label><label>自有文件或关联变更说明<textarea name="note" required></textarea></label><button>保存资料关联</button></form></section>
 <h2>申请时间线</h2>{% for e in events %}<article><strong>{{labels.get(e.status,e.status)}}</strong> · {{e.event_date or e.created_at[:10]}}<small>（记录于 {{e.created_at}}）</small><p>{{e.note}}</p>{% if e.basis %}<p>用途 {{states.get(e.basis.usage,e.basis.usage)}} · 岗位依据 {{e.basis.snapshot_id or "未关联"}} · 事实 {{e.basis.resume_version_id or "未关联"}} · 材料 {{e.basis.material_id or "未关联"}}</p>{% endif %}</article>{% endfor %}
+<section class="pack-section"><h2>投递信息包</h2><p class="notice">本信息包只在本机生成，供本人在招聘网站自行填写与核对；程序不填写、不上传、不提交任何真实招聘表单。</p>
+<div class="pack-actions"><form action="/applications/{{application.id}}/pack" method="post">{{token()}}<button>生成新的信息包版本</button></form><a class="button" href="/applications/{{application.id}}/pack/export">导出 Markdown 清单</a></div>
+{% if pack %}{% set pack_data=pack.data %}
+<p class="muted">当前版本 #{{pack.version}} · 生成于 {{pack.created_at[:16].replace('T',' ')}}</p>
+<h3>基础信息</h3><dl class="pack-fields">{% for f in pack_data.fields %}<div><dt>{{f.label}}</dt><dd>{% if f.value %}{{f.value}}{% else %}<span class="notice">需本人填写</span>{% endif %}{% if f.source %} <small>（来源：{{f.source}}）</small>{% endif %}</dd></div>{% endfor %}</dl>
+{% if pack_data.groups %}{% for g in pack_data.groups %}<details><summary>{{g.title}}</summary>{% for item in g['items'] %}<p>{% if item.text is defined %}{{item.text}}{% else %}{{item}}{% endif %}</p>{% endfor %}<p class="muted">来源：{{g.source}}</p></details>{% endfor %}{% endif %}
+{% if pack_data.cover_letter %}<details><summary>求职信草稿（需本人核对）</summary><pre>{{pack_data.cover_letter}}</pre></details>{% endif %}
+{% if pack_data.questions %}<details><summary>JD 中的问题（草稿，需本人确认）</summary>{% for q in pack_data.questions %}<p><strong>{{q.question}}</strong>：{% if q.answer %}{{q.answer}}{% else %}<span class="notice">需本人填写</span>{% endif %}</p>{% endfor %}</details>{% endif %}
+{% if pack_data.attachments %}<details><summary>需要自行上传的附件</summary>{% for at in pack_data.attachments %}<p>{{at.label}}：{{at.filename or '未保存'}} <small>（{{at.note}}）</small></p>{% endfor %}</details>{% endif %}
+{% if pack_data.missing %}<p class="notice" role="alert">仍需本人补齐：{{pack_data.missing|join('、')}}</p>{% endif %}
+{% else %}<p class="muted">尚未生成信息包版本。点击上方按钮，按当前已保存的依据生成一份清单。</p>{% endif %}
+</section>
 {% elif page=='task' %}
 <h1>任务 #{{task.id}} · {{task.kind}}</h1><p>状态 <strong>{{task.status}}</strong> · 尝试 {{task.attempts}} / {{task.max_attempts}}</p><p>{{task.error}}</p><a href="">刷新实际状态</a>
-{% if task.status in ['queued','running'] %}<script>setTimeout(()=>location.reload(),3000)</script>{% endif %}
+<div class="task-live" data-poll="/tasks/{{task.id}}/status" data-reload-on="succeeded,failed,uncertain" data-reload-from="{{task.status}}">{% include 'task_progress.html' with context %}</div>
 {% if task.result %}
 {% if task.result.review_issues %}<h2>内容审阅未通过</h2><p>Worker 不会自动重跑</p><ul>{% for issue in task.result.review_issues %}<li>{{issue}}</li>{% endfor %}</ul>{{review_history(task.result.review_history)}}{% endif %}
 {% if task.result.preparation_id %}<a href="/preparations/{{task.result.preparation_id}}">查看准备进度</a>{% endif %}
@@ -245,12 +283,10 @@
 {% if task.kind=='search' %}<p>{{task.result.message}} 已保存 {{task.result.count}} 条。<a href="/jobs">查看岗位</a></p>{% for source,r in task.result.sources.items() %}<p>{{source}} · {{r.status}} · {{r.count}} {{r.error}}</p>{% endfor %}{% endif %}
 {% if task.result.html %}<p>{{'未发送：本地预览' if task.result.status=='preview' else ('SMTP 已接受，不代表送达' if task.result.status=='accepted' else task.result.status)}}</p><iframe title="邮件预览" sandbox style="width:100%;height:420px" srcdoc="{{task.result.html}}"></iframe>{% endif %}{% endif %}
 {% if task.kind=='search' and task.status=='succeeded' and task.result and task.result.sources and task.result.sources.values()|selectattr('status','equalto','failed')|list|length %}<form action="/tasks/{{task.id}}/retry" method="post">{{token()}}<button>仅重试失败来源（如有）</button></form>{% endif %}
-{% if task.kind!='fill' and (task.status in ['failed','uncertain'] or (task.result and task.result.status=='preview')) %}<form action="/tasks/{{task.id}}/retry" method="post">{{token()}}{% if task.status=='uncertain' %}<label><input type="checkbox" name="confirmed" value="yes" required> 已核对外部发送结果，理解可能重复发送</label>{% endif %}<button>修复问题后重试</button></form>{% endif %}
+{% if task.kind!='fill' and (task.status in ['failed','uncertain'] or (task.result and task.result.status=='preview')) %}<form action="/tasks/{{task.id}}/retry" method="post">{{token()}}{% if task.status=='uncertain' %}<label><input type="checkbox" name="confirmed" value="yes" required> 已核对外部发送结果，理解可能重复发送</label>{% endif %}<button>{{'按当前配置重新发送' if task.result and task.result.status=='preview' else '修复问题后重试'}}</button></form>{% endif %}
 {% for a in attempts %}<p>{{a.created_at}} · {{a.status}} · {{a.detail}}</p>{% endfor %}
 {% elif page=='error' %}<h1>操作提示</h1><p class="notice">{{error}}</p><a href="/">返回首页</a>{% endif %}
-</main><script>
-document.querySelectorAll('[data-poll]').forEach(el=>{async function refresh(){try{let r=await fetch(el.dataset.poll);if(r.ok){let text=await r.text();if(text!==el.innerHTML){el.innerHTML=text;document.dispatchEvent(new CustomEvent('career:motion-refresh',{detail:{element:el}}));if(el.dataset.reloadOn==='profile-import'&&text.includes('data-profile-import-complete')){location.reload();return;}}}}catch(e){} }refresh();setInterval(refresh,2000)});
-</script>
+</main><script src="{{ url_for('static', filename='poll.js') }}" defer></script>
 <script src="{{ url_for('static', filename='vendor/gsap/gsap.min.js') }}" defer></script>
 <script src="{{ url_for('static', filename='vendor/gsap/ScrollTrigger.min.js') }}" defer></script>
 <script src="{{ url_for('static', filename='motion.js') }}" defer></script>

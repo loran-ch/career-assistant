@@ -262,6 +262,24 @@ button:focus-visible,.button:focus-visible,.profile-nav a:focus-visible,.item-ed
 .resume-versions dt{color:#536777}
 .resume-versions dd{margin:0;min-width:0;color:#143853;overflow-wrap:anywhere}
 .resume-versions code{font-size:12px}
+.board-summary .board-counts{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.board-summary .board-counts span{padding:5px 10px;border-radius:4px;background:#edf3f6;color:#344b5e;font-size:13px;font-weight:650}
+.board-summary .board-counts strong{color:#143853;font-size:17px}
+.board-columns{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:12px}
+.board-column{padding:12px;border:1px solid #dce4ec;border-radius:6px;background:#f8fafb}
+.board-column h3{margin:0 0 8px;display:flex;align-items:center;gap:6px;font-size:15px}
+.board-column article{padding:8px 0;border-top:1px solid #e5ebf0}
+.board-column article p{margin:3px 0 0;font-size:13px}
+.board-filter{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;margin:10px 0}
+.board-filter label{margin:0;display:grid;gap:4px}
+.pack-section{margin-top:22px;padding-top:16px;border-top:1px solid #dce4ec}
+.pack-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0}
+.pack-actions form{margin:0}
+.pack-actions .button{margin:0}
+.pack-fields{margin:10px 0;border-top:1px solid #dce4ec}
+.pack-fields>div{display:grid;grid-template-columns:minmax(120px,180px) minmax(0,1fr);gap:12px;padding:7px 2px;border-bottom:1px solid #e5ebf0}
+.pack-fields dt{color:#536777}
+.pack-fields dd{margin:0;color:#143853;overflow-wrap:anywhere}
 
 @media (max-width:860px){
   .profile-workspace{grid-template-columns:minmax(0,1fr)}
@@ -316,6 +334,7 @@ button:focus-visible,.button:focus-visible,.profile-nav a:focus-visible,.item-ed
   .resume-versions dl>div{grid-template-columns:minmax(0,1fr);gap:2px}
   .approval-actions{align-items:stretch;flex-direction:column-reverse}
   .approval-actions .button,.approval-actions button{width:100%;text-align:center;box-sizing:border-box}
+  .pack-fields>div{grid-template-columns:minmax(0,1fr);gap:2px}
 }
 
 .app-header{background:#143853;padding:0;box-shadow:0 1px 0 rgba(255,255,255,.08)}

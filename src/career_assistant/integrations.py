@@ -183,6 +183,48 @@ def render_recommendations(jobs: list[JobPosting], report_url: str) -> str:
     )
 
 
+def _as_text(value) -> str:
+    """把 SMTP 返回的 bytes 消息转成可读文本。"""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value or "")
+
+
+def _is_auth_failure(code, message: str) -> bool:
+    """判断是不是「凭据被拒」，需要给出可执行的排查指引。"""
+    if code == 535:
+        return True
+    lowered = message.lower()
+    return any(token in lowered for token in
+               ("authentication failed", "authenticate", "login denied", "not enabled"))
+
+
+def _smtp_failure_detail(exc: Exception) -> str:
+    """把 SMTP 服务器的真实拒绝原因带上，别只丢一个异常类名。
+
+    只透出错误码与服务器回复，不含账号、授权码等任何凭据。
+    """
+    code = getattr(exc, "smtp_code", None)
+    raw = getattr(exc, "smtp_error", b"")
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        # 形如 {"addr@example.com": (550, b"Mailbox unavailable")}
+        details = [f"{address} → {info[0]} {_as_text(info[1])}"
+                   for address, info in (getattr(exc, "recipients", None) or {}).items()]
+        raw = "；".join(details) or raw
+    message = _as_text(raw).strip()
+    text = f"SMTP 明确拒绝（{type(exc).__name__}"
+    if code:
+        text += f"，代码 {code}"
+    text += "）。"
+    if message:
+        text += f" 服务器回复：{message}。"
+    if _is_auth_failure(code, message):
+        text += (" 认证被拒：请确认 SMTP_USER 是完整邮箱地址、SMTP_PASSWORD 是邮箱设置页"
+                 "「POP3/SMTP/IMAP 服务」里生成的【客户端授权码】（不是网页登录密码），"
+                 "并确认该邮箱已开启 SMTP 服务。")
+    return text
+
+
 def send_email(subject: str, html: str) -> dict:
     """One SMTP attempt; caller stores and retries independently from analysis.
 
@@ -192,7 +234,10 @@ def send_email(subject: str, html: str) -> dict:
     """
     host = os.getenv("SMTP_HOST", "").strip()
     if not host:
-        return {"status": "preview", "error": "未配置 SMTP；仅生成本地预览，未发送。"}
+        return {"status": "preview", "error": (
+            "未配置 SMTP；仅生成本地预览，未发送。"
+            "请在 .env 里填好 SMTP_HOST / SMTP_USER / SMTP_PASSWORD / SMTP_TO，"
+            "重启程序后再点「按当前配置重新发送」即可真正发出。")}
     user = os.getenv("SMTP_USER", "").strip()
     password = os.getenv("SMTP_PASSWORD", "")
     sender = os.getenv("SMTP_FROM", user).strip()
@@ -226,13 +271,14 @@ def send_email(subject: str, html: str) -> dict:
             ),
         }
     except (smtplib.SMTPRecipientsRefused, smtplib.SMTPResponseException) as exc:
-        return {"status": "failed", "error": f"SMTP 明确拒绝（{type(exc).__name__}）。"}
+        return {"status": "failed", "error": _smtp_failure_detail(exc)}
     except Exception as exc:
-        return {
-            "status": "uncertain" if sending else "failed",
-            "error": f"SMTP {'发送结果不确定，请人工核对后决定是否重发' if sending else '连接或配置失败'}"
-                     f"（{type(exc).__name__}）。",
-        }
+        message = _as_text(getattr(exc, "smtp_error", b"")).strip()
+        detail = (f"SMTP {'发送结果不确定，请人工核对后决定是否重发' if sending else '连接或配置失败'}"
+                  f"（{type(exc).__name__}）。")
+        if message:
+            detail += f" 服务器回复：{message}。"
+        return {"status": "uncertain" if sending else "failed", "error": detail}
     finally:
         if conn is not None:
             try:

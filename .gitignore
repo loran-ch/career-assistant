@@ -17,6 +17,9 @@
 /docs/*
 !/docs/UPSTREAM.md
 !/docs/KAFKA_DOCKER.md
+!/docs/B_*.md
+!/docs/BE_*.md
+!/docs/E_*.md
 /src/*
 !/src/career_assistant/
 !/data/
